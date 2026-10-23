@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AnnaOps synthetic surplus-food coordination demo">
+  <title>AnnaOps — Food Coordination</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="brandmark">A</span><span>AnnaOps</span></a>
+    <nav class="topnav" aria-label="Dashboard navigation">
+      <a href="#operations">Operations</a><a href="#agent-monitor">Agent monitor</a><a href="#donor-intake">New offer</a>
+    </nav>
+    <div class="top-status"><span class="pulse"></span> Local demo <span class="divider"></span> Synthetic NGOs only</div>
+  </header>
+
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">AGENT-ASSISTED COORDINATION</p>
+        <h1>Move surplus food with<br><em>care, clarity, and control.</em></h1>
+        <p class="hero-copy">Language understanding proposes. Deterministic rules protect. A human approves every simulated dispatch.</p>
+      </div>
+      <div class="system-card">
+        <div class="system-row"><span>Intake</span><strong id="llmMode">Checking…</strong></div>
+        <div class="system-row"><span>Routing</span><strong id="routingMode">Checking…</strong></div>
+        <div class="system-row"><span>Environment</span><strong>Synthetic demo</strong></div>
+        <p>No real NGO requests or deliveries are sent from this application.</p>
+      </div>
+    </section>
+
+    <section class="metrics" id="metrics" aria-label="Workflow metrics"></section>
+
+    <section class="demo-lab" id="operations">
+      <div class="section-heading">
+        <div><p class="eyebrow">INTERACTIVE JUDGE LAB</p><h2>Run a real persisted workflow</h2></div>
+        <p>Each launcher creates one synthetic donation through the same API and agents as donor intake. Nothing here is a decorative animation.</p>
+      </div>
+      <div class="scenario-grid">
+        <button class="scenario-card" data-scenario="complete"><span class="scenario-index">A</span><strong>Complete lifecycle</strong><small>Eligible offer → approval → simulated acceptance → delivery confirmation</small></button>
+        <button class="scenario-card" data-scenario="missing"><span class="scenario-index">B</span><strong>Missing information</strong><small>Inspect missing facts, clarify, and resume the real workflow</small></button>
+        <button class="scenario-card" data-scenario="rejection"><span class="scenario-index">C</span><strong>Rejection & replan</strong><small>Approve, decline, exclude the receiver, and require fresh approval</small></button>
+        <button class="scenario-card" data-scenario="safety"><span class="scenario-index">D</span><strong>Safety review</strong><small>Trigger deterministic review and verify dispatch remains blocked</small></button>
+        <button class="scenario-card" data-scenario="escalation"><span class="scenario-index">E</span><strong>Retry exhaustion</strong><small>Exercise two failed attempts and human escalation</small></button>
+      </div>
+      <p class="demo-guidance" id="demoGuidance">Select a scenario to create a fresh synthetic case.</p>
+    </section>
+
+    <section class="monitor-panel" id="agent-monitor">
+      <div class="section-heading monitor-heading">
+        <div><p class="eyebrow">AGENT WORKFLOW MONITOR</p><h2 id="monitorTitle">Select a donation</h2></div>
+        <div class="legend"><span class="dot completed"></span>Completed <span class="dot awaiting_human"></span>Human input <span class="dot blocked"></span>Blocked <span class="dot pending"></span>Pending</div>
+      </div>
+      <div id="workflowSpotlight" class="workflow-spotlight"><div class="empty">Choose a donation to inspect persisted agent execution.</div></div>
+    </section>
+
+    <section class="workspace" id="donor-intake">
+      <article class="panel compose-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">DONOR INTAKE</p><h2>Describe the available food</h2></div>
+          <span class="step">01</span>
+        </div>
+        <form id="donationForm">
+          <label for="message">Donation message</label>
+          <textarea id="message" rows="7" required minlength="5" placeholder="What food is available, how much, when it was prepared, storage, pickup deadline, and location…"></textarea>
+          <div class="examples">
+            <span>Try an example:</span>
+            <button type="button" class="text-button" data-example="complete">Complete offer</button>
+            <button type="button" class="text-button" data-example="missing">Missing details</button>
+            <button type="button" class="text-button" data-example="review">Needs review</button>
+          </div>
+          <button class="primary" type="submit" id="submitButton"><span>Run coordinated intake</span><span>→</span></button>
+          <p class="form-note">Demo safety rules are not regulatory certification. Submit only synthetic data.</p>
+        </form>
+      </article>
+
+      <article class="panel queue-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">DONATION INBOX</p><h2>Persisted cases</h2></div>
+          <button class="icon-button" id="refreshButton" aria-label="Refresh">↻</button>
+        </div>
+        <div class="filters">
+          <input id="searchInput" type="search" placeholder="Search message or ID">
+          <select id="statusFilter"><option value="">All statuses</option></select>
+        </div>
+        <div id="donationList" class="donation-list"><div class="empty">Loading donations…</div></div>
+      </article>
+    </section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="detailDrawer" aria-label="Donation detail" aria-hidden="true">
+    <div class="drawer-header">
+      <div><p class="eyebrow">DONATION DETAIL</p><h2 id="detailTitle">Offer</h2></div>
+      <button class="icon-button" id="closeDrawer" aria-label="Close">×</button>
+    </div>
+    <div id="detailContent" class="drawer-content"></div>
+  </aside>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
+
