@@ -367,11 +367,23 @@ def test_live_gemini_smoke_test():
         f"pickup by {(now + timedelta(hours=2)).isoformat()} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
     )
 
-    invocation = client.complete_structured(
-        ExtractedOffer,
-        system_prompt="You are the AnnaOps intake agent. Extract structured facts into ExtractedOffer schema.",
-        user_payload={"original_donor_message": message},
-    )
+    invocation = None
+    last_err = None
+    import time
+    for attempt in range(3):
+        try:
+            invocation = client.complete_structured(
+                ExtractedOffer,
+                system_prompt="You are the AnnaOps intake agent. Extract structured facts into ExtractedOffer schema.",
+                user_payload={"original_donor_message": message},
+            )
+            break
+        except LLMRetryableError as err:
+            last_err = err
+            time.sleep(2)
+
+    if invocation is None:
+        raise last_err
 
     assert invocation.provider == "gemini"
     assert invocation.model == "gemini-3.6-flash"
