@@ -1,207 +1,141 @@
-# अन्न ops: Surplus-Food Donation Coordination with OpenAI-Compatible LLM Providers
+# अन्न ops
 
-अन्न ops is a local-first, agentic surplus-food donation coordination system. It transforms raw donor messages into structured, validated food donation offers, enforces authoritative deterministic food safety rules, dynamically reasons over eligible receiver organizations, requests donor approval, simulates NGO responses, replans failed attempts, and maintains an immutable audit trail.
+Local-first surplus-food donation coordination with a FastAPI backend, SQLite
+persistence, a LangGraph workflow, and a small browser dashboard.
 
-> **Important:** Every NGO, geographic coordinate, dispatch notification, and delivery confirmation in this repository is synthetic. अन्न ops is a safe simulation system for agentic workflow orchestration and evaluation.
+> **Simulation only:** NGOs, locations, routes, dispatches, and deliveries are
+> synthetic. This project is not a food-safety certification or production
+> donation service.
 
----
+## What it does
 
-## Architecture & Configured LLM Integration
+1. Accepts a donor's natural-language offer.
+2. Uses the configured OpenAI-compatible LLM to extract a validated offer.
+3. Requests clarification when required facts are missing or contradictory.
+4. Applies deterministic, versioned food-safety rules.
+5. Uses persisted synthetic receiver demand and capacity to rank eligible NGOs.
+6. Collects donor approval, simulates NGO responses, retries or escalates failed
+   dispatches, and records each transition in SQLite.
 
-अन्न ops uses the configured OpenAI-compatible provider for all designated agent operations. Groq is selected when `GROQ_API_KEY` is present; otherwise Gemini remains supported. Silent fallback to deterministic parsing or predetermined agent decisions is strictly prohibited.
+The LLM proposes bounded actions; backend code remains authoritative for
+validation, safety, permissions, idempotency, budgets, and state transitions.
+LLM failures are explicit and persisted as `ERROR` rather than silently falling
+back to a different decision path.
 
-### Canonical Configuration
+## Architecture
 
-| Setting | Canonical Value / Variable | Purpose |
-| :--- | :--- | :--- |
-| **Provider** | Groq or Google Gemini (OpenAI-compatible) | Generative intelligence provider |
-| **Groq model** | `openai/gpt-oss-20b` (`GROQ_MODEL`) | Default cost-efficient agentic model |
-| **Groq API key** | `GROQ_API_KEY` | Required when Groq is selected |
-| **Groq base URL** | `https://api.groq.com/openai/v1` | OpenAI-compatible endpoint root |
-| **Gemini model** | `gemini-3.6-flash` (`ANNAOPS_GEMINI_MODEL`) | Gemini fallback model |
-| **Timeout** | `ANNAOPS_LLM_TIMEOUT_SECONDS` (default: `20`) | Strictly bounded per-call model timeout |
-| **Max Iterations** | `ANNAOPS_AGENT_MAX_ITERATIONS` (default: `3`) | Bounded tool-calling execution ceiling |
+| Area | Location | Responsibility |
+| --- | --- | --- |
+| HTTP API and dashboard hosting | `annaops/main.py` | FastAPI routes, lifecycle, error responses, static UI |
+| Workflow orchestration | `annaops/workflow.py` | LangGraph intake → safety → matching flow |
+| Agent implementations | `annaops/agents/` | Intake, coordinator, receiver advice, dispatch, safety, runtime |
+| Domain models | `annaops/schemas.py` | Pydantic requests, offers, matches, decisions, statuses |
+| Persistence | `annaops/db.py` | SQLite schema, transactions, audit events, budgets, idempotency |
+| Provider client | `annaops/llm.py` | OpenAI-compatible structured LLM calls and bounded retries |
+| Frontend | `static/` | Agent Command Centre dashboard |
+| Synthetic seed data | `annaops/seed.py` | Demo NGOs, demand, and scenarios |
 
-Conflicting defaults (such as `gemini-2.5-flash` or `gemini-3.8-flash`) have been removed. The application strictly validates this configuration on startup.
+## Requirements
 
----
-
-## Agent Operations Powered by the Configured LLM
-
-1. **Intake Agent (`annaops/agents/intake.py`)**:
-   - Uses the configured provider/model for structured extraction from natural language donor offers.
-   - Enforces Pydantic schema validation (`ExtractedOffer`) preserving food items, quantities, units, preparation timestamps, storage conditions, and coordinates.
-   - Detects missing facts and contradictory timestamps, formulating targeted clarification questions.
-   - If extraction fails or the provider is unreachable, an explicit failure is raised; silent fallback to a deterministic regex parser is prohibited.
-
-2. **Receiver Advisor Agent (`annaops/agents/receiver_advisor.py`)**:
-   - Executes inside a bounded tool-use runtime (`BoundedToolRuntime`).
-   - Inspects real registered tool outputs (`retrieve_receiver_profiles`, `run_eligibility_and_scoring`, `inspect_previous_attempts`).
-   - The configured model analyzes trade-offs and recommends an eligible receiver.
-   - The recommendation is strictly validated against the authoritative eligible candidate set. If the model proposes an ineligible receiver or an invalid action, the operation explicitly fails with `AgentProtocolError`.
-
-3. **Workflow Coordinator (`annaops/agents/coordinator.py`)**:
-   - The configured model inspects persisted workflow state via registered tool `read_persisted_workflow_state` and proposes the next workflow operation.
-   - Proposes actions from a bounded set (`run_intake`, `run_safety`, `run_matching`, `durable_pause`).
-   - Authoritative backend code enforces state transition gates, role permissions, and idempotency.
-
-4. **Dispatch & Replanning Agent (`annaops/agents/dispatch.py`)**:
-   - When an NGO declines or times out, the configured model evaluates previous attempts, reasons about candidate alternatives, and proposes retry or escalation.
-   - Hard retry limits (`ANNAOPS_MAX_DISPATCH_ATTEMPTS = 2`) and attempted-receiver exclusions are strictly enforced deterministically.
-
-5. **Authoritative Deterministic Controls**:
-   - Food safety rules, temperature/time limits, database transactions, role authorization gates, and state persistence are strictly deterministic. The LLM can never override a safety block, manufacture missing facts, or make an ineligible receiver eligible.
-
----
-
-## Safe, Recoverable Error Handling
-
-When an LLM provider error occurs, अन्न ops guarantees safe, non-corrupting behavior:
-- **Missing API key or invalid model:** Fails application startup with actionable error guidance.
-- **Provider unreachable / Rate limit (429) / Timeout:** Raises `LLMRetryableError` (HTTP 503 `retryable_provider_error`).
-- **Malformed structured response:** Raises `LLMResponseError` (HTTP 502 `invalid_model_output`).
-- **Invalid agent action / Ineligible receiver proposal:** Raises `AgentProtocolError` (HTTP 502 `agent_protocol_failure`).
-- **Iteration limit exhausted:** Raises `AgentExecutionLimitError` (HTTP 502).
-
-In all failure scenarios:
-- The donation transitions safely to `ERROR` status (`WORKFLOW_ERROR`).
-- An agent execution record is persisted with status `failed`, capturing the configured provider/model, error category, and diagnostics.
-- The UI exposes a **Retry Processing** action that triggers `POST /api/donations/{id}/retry` once the provider recovers.
-
----
-
-## Agent Command Centre (UI)
-
-The UI explicitly visualizes the agentic workflow and distinguishes:
-- **LLM Execution Succeeded** (Green badge, configured model identifier).
-- **LLM Execution Failed** (Red badge with error category and diagnostic details).
-- **Retryable Provider Failure** (Warning badge with retry guidance and a 1-click Retry button).
-- **Awaiting Human Input** (Purple gate indicator for donor approvals or coordinators).
-- **Deterministic Rule Enforcement** (Blue badge for safety, eligibility, and state transitions).
-
----
-
-## Quick Start (Local Setup)
-
-### 1. Prerequisites
 - Python 3.11+
-- Google AI Studio Gemini API Key: [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+- One OpenAI-compatible provider:
+  - **Groq** (selected when `GROQ_API_KEY` is present), or
+  - **Gemini** (`ANNAOPS_GEMINI_API_KEY`)
 
-### 2. Installation
+## Run locally
+
 ```powershell
-# Create and activate virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-# Install dependencies
 python -m pip install -r requirements.txt
-
-# Configure environment variables
 Copy-Item .env.example .env
 ```
 
-Edit `.env` to supply your API key:
+Configure `.env` with one provider. Groq is the default example:
+
 ```env
-GROQ_API_KEY=gsk_...
+GROQ_API_KEY=your_key
 GROQ_MODEL=openai/gpt-oss-20b
 GROQ_BASE_URL=https://api.groq.com/openai/v1
-ANNAOPS_LLM_BUDGET_PER_DONATION=5
-ANNAOPS_LLM_BUDGET_EXTENSION=2
-ANNAOPS_LLM_MAX_RETRIES=2
-ANNAOPS_LLM_CONCURRENCY_LIMIT=2
+
+# Or use Gemini when GROQ_API_KEY is absent:
+# ANNAOPS_GEMINI_API_KEY=your_key
+# ANNAOPS_GEMINI_MODEL=gemini-3.6-flash
+# ANNAOPS_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 ```
 
-### Groq diagnostic
-
-Run one minimal live request using the same environment and configuration as the
-application:
+Start the service:
 
 ```powershell
-python scripts/diagnose_groq.py
-```
-
-The command never prints the API key and exits non-zero when authentication,
-permission/model access, rate limiting, endpoint, or transport errors occur.
-A Groq HTTP 403 with error code `1010` indicates an organization or project
-model-permission restriction; check the model permissions in Groq Console rather
-than changing providers silently.
-
-Quota controls reserve every actual Gemini request, including tool rounds and retries, in SQLite before the provider call. The default budget is five requests per donation, survives restarts, and cannot be reset by a repeated UI request. A coordinator can explicitly extend a donation's budget through `POST /api/donations/{id}/llm-budget-extension` using a coordinator actor; the extension is audited. Transport retries are bounded, use exponential backoff with jitter, honor `Retry-After`, and are globally concurrency-limited.
-
-### Measured request reduction
-
-The offline complete-workflow test uses the injected test client only to count model rounds (it does not contact Gemini). The previous graph re-entered the LLM coordinator after intake, safety, and matching: 8 coordinator rounds (two tool/final rounds at each of four coordinator nodes) plus 1 intake round and 2 receiver-advisor rounds = **11 model rounds**. The optimized graph runs the coordinator once and routes deterministic stage transitions directly: 2 coordinator rounds + 1 intake round + 2 receiver-advisor rounds = **5 model rounds**, a measured reduction of 6 rounds (54.5%). Live token counts remain unavailable unless the provider includes a `usage` object; the API reports that state explicitly rather than estimating it.
-
-### 3. Run Application
-```powershell
-# Start Uvicorn dev server
 .\.venv\Scripts\python.exe -m uvicorn annaops.main:app --env-file .env --port 8000
 ```
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. API Swagger docs are at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-### 4. Run one complete live synthetic workflow
+Open the dashboard at <http://127.0.0.1:8000> or API docs at
+<http://127.0.0.1:8000/docs>.
 
-With the application running and the configured provider reachable, open a second PowerShell window and run:
+Seed or reset synthetic data with:
+
+```powershell
+.\.venv\Scripts\python.exe -m annaops
+```
+
+## Workflow and API
+
+The main path is:
+
+`INTAKE_PROCESSING` → `NEEDS_CLARIFICATION` or `PENDING_SAFETY_REVIEW` →
+`MATCHING` → `AWAITING_DONOR_APPROVAL` → `AWAITING_NGO_RESPONSE` →
+`ACCEPTED` → `COMPLETED`
+
+Safety blocks, human review, provider errors, declines, timeouts, and bounded
+escalation are represented as explicit statuses.
+
+Key endpoints:
+
+- `POST /api/donations` — create and process an offer
+- `GET /api/donations` and `GET /api/donations/{id}` — inspect offers
+- `POST /api/donations/{id}/clarify` — submit missing facts
+- `POST /api/donations/{id}/safety-review` — resolve human safety review
+- `POST /api/donations/{id}/approve` — record donor approval
+- `POST /api/donations/{id}/ngo-response` — simulate `accept`, `decline`, or `timeout`
+- `POST /api/donations/{id}/delivery-confirmation` — complete a delivery
+- `POST /api/donations/{id}/retry` — retry an `ERROR` workflow
+- `GET /api/donations/{id}/workflow` — view the workflow projection
+- `GET /api/donations/{id}/agent-executions` — inspect agent/tool execution records
+- `GET /api/donations/{id}/audit` — inspect the immutable audit trail
+- `GET /api/ngos`, `/api/health`, `/api/metrics` — inspect system state
+- `POST /api/demo/scenario/{scenario}` — run a synthetic Judge Lab scenario
+
+Supported demo scenarios include `complete`, `missing`, `safety`, `rejection`,
+`escalation`, `demand_pasta`, `demand_incompatible`, and
+`demand_quantity_mismatch`.
+
+## Tests and diagnostics
+
+The default suite uses an injected mock client and does not call a live provider:
+
+```powershell
+.\.venv\Scripts\pytest
+```
+
+Run a live provider smoke test only when explicitly needed:
+
+```powershell
+$env:ANNAOPS_GEMINI_API_KEY="your_key"
+.\.venv\Scripts\pytest -m live_llm
+```
+
+For a complete synthetic API workflow:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_e2e_demo.py --scenario annaops_e2e_success
 ```
 
-The runner verifies redacted provider readiness and seeded synthetic demand, submits a fresh donation through the public API, checks the persisted intake/safety/matching evidence, performs explicit demo donor approval, simulates an eligible NGO acceptance, confirms synthetic delivery, and independently rereads the final donation, workflow, audit trail, and NGO capacity. It prints `PASS`, `FAIL`, or `NOT RUN` for all fourteen required stages and exits non-zero on any failure. It never prints the API key.
+For a provider connectivity check:
 
----
-
-## Deployment Configuration
-
-When deploying अन्न ops to hosted environments (e.g., Cloud Run, Render, Railway, AWS ECS):
-1. **Never commit `.env` to version control.**
-2. Configure environment variables in the hosting dashboard:
-   - `ANNAOPS_GEMINI_API_KEY`: Your production Google AI Studio key.
-   - `ANNAOPS_GEMINI_MODEL`: `gemini-3.6-flash` when Gemini is selected.
-   - `ANNAOPS_GEMINI_BASE_URL`: `https://generativelanguage.googleapis.com/v1beta/openai`.
-   - `ANNAOPS_DATABASE_PATH`: Path to persistent SQLite storage (e.g. `/data/annaops.db`).
-   - `ANNAOPS_TIMEZONE`: e.g. `Asia/Kolkata` or your operational timezone.
-3. If `ANNAOPS_GEMINI_API_KEY` is omitted, the production server will refuse to start and fail with a clear configuration error.
-
----
-
-## Running Automated Tests
-
-अन्न ops features a comprehensive test suite covering mandatory Gemini configuration, error handling, safety, and agent workflows.
-
-### 1. Default Offline Test Suite (Using Injected Mock Client)
-The automated test suite runs completely offline with mocked HTTP responses and test-only client injection (`TestMockClient`). No live API credits or internet connectivity are required:
 ```powershell
-.\.venv\Scripts\pytest
-```
-All 50 tests will execute and pass deterministically.
-
-### 2. Opt-in Live provider smoke test
-An explicitly opt-in live test verifies real network connectivity and structured output extraction against the configured provider endpoint:
-```powershell
-# Set your real API key in the shell
-$env:ANNAOPS_GEMINI_API_KEY="AIzaSy..."
-
-# Execute the live test
-.\.venv\Scripts\pytest -m live_llm
+.\.venv\Scripts\python.exe scripts\diagnose_groq.py
 ```
 
----
-
-## API Summary
-
-- `POST /api/donations`: Create and process a donation offer with the configured LLM provider/model.
-- `POST /api/donations/{id}/retry`: Authorised retry of a failed donation after provider recovery.
-- `GET /api/donations/{id}/agent-executions`: Full audit trail of agent executions, tool calls, and model outputs.
-- `POST /api/donations/{id}/llm-budget-extension`: Audited coordinator-only recovery budget extension.
-- `GET /api/donations/{id}/workflow`: Current 10-stage workflow projection and timing.
-- `POST /api/donations/{id}/approve`: Donor approval gate.
-- `POST /api/donations/{id}/ngo-response`: Simulated receiver response (`accept` / `decline` / `timeout`).
-- `POST /api/donations/{id}/delivery-confirmation`: Final coordinator delivery confirmation.
-- `GET /api/ngos`: List synthetic NGO profiles, active item demands, remaining demand, and capacity.
-- `POST /api/demo/scenarios/{scenario}`: Run interactive Judge Lab demo scenarios (`complete`, `demand_pasta`, `demand_incompatible`, `demand_quantity_mismatch`, `missing`, `rejection`, `safety`, `escalation`).
-- `GET /api/donations/{id}/record.csv`: Export synthetic donation record with disclaimer.
-
-Synthetic NGO demand is seeded idempotently by `python -m annaops.seed`. Matching requires
-the persisted demand item and unit to be compatible; kilograms are never treated as meal portions.
-Acceptance atomically reserves the matching demand and receiver capacity in the local SQLite data layer.
+Never commit `.env` or API keys. SQLite data is written to
+`ANNAOPS_DATABASE_PATH` (default: `data/annaops.db`).
