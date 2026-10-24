@@ -514,7 +514,7 @@ def test_live_gemini_smoke_test():
         try:
             invocation = client.complete_structured(
                 ExtractedOffer,
-                system_prompt="You are the AnnaOps intake agent. Extract structured facts into ExtractedOffer schema.",
+                system_prompt="You are the अन्न ops intake agent. Extract structured facts into ExtractedOffer schema.",
                 user_payload={"original_donor_message": message},
             )
             break

@@ -56,7 +56,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         yield
 
     app = FastAPI(
-        title="AnnaOps",
+        title="अन्न ops",
         version=__version__,
         description="Surplus-food donation coordination powered by the configured LLM provider.",
         lifespan=lifespan,
@@ -416,7 +416,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         donation = database.get_donation(donation_id)
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["AnnaOps synthetic donation record"])
+        writer.writerow(["अन्न ops synthetic donation record"])
         writer.writerow(["This record documents a local simulation; it is not proof of a real-world delivery."])
         writer.writerow([])
         writer.writerow(["field", "value"])

@@ -665,10 +665,10 @@ class Database:
                 SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens
                 FROM llm_usage"""
             ).fetchone()
-            by_status["GEMINI_REQUESTS"] = usage["requests"] or 0
+            by_status["LLM_REQUESTS"] = usage["requests"] or 0
             by_status["GEMINI_RETRIES"] = usage["retries"] or 0
             by_status["GEMINI_FAILED_REQUESTS"] = usage["failed"] or 0
-            by_status["GEMINI_RATE_LIMIT_ERRORS"] = usage["rate_limits"] or 0
+            by_status["LLM_RATE_LIMIT_ERRORS"] = usage["rate_limits"] or 0
             by_status["GEMINI_INPUT_TOKENS"] = usage["input_tokens"]
             by_status["GEMINI_OUTPUT_TOKENS"] = usage["output_tokens"]
             return by_status

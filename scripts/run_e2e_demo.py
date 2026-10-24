@@ -131,7 +131,7 @@ def print_report(
     stages: list[Stage], *, provider: str | None, model: str | None, donation: dict[str, Any] | None,
     ngo_name: str | None, failure: str | None
 ) -> None:
-    print("\nAnnaOps live E2E result")
+    print("\nअन्न ops live E2E result")
     print("=" * 96)
     print(f"{'#':>2}  {'RESULT':<8} {'STAGE':<39} {'STATE':<25} {'MS':>7}  EXECUTION")
     for number, stage in enumerate(stages, 1):
@@ -286,7 +286,7 @@ def run(base_url: str, timeout: float) -> int:
 
         donation, delivery_ms = api.post(
             f"/api/donations/{donation['id']}/delivery-confirmation",
-            {"actor": "demo_coordinator", "verification_note": "Synthetic delivery confirmed by the AnnaOps E2E runner", "idempotency_key": f"delivery-{run_id}"},
+            {"actor": "demo_coordinator", "verification_note": "Synthetic delivery confirmed by the अन्न ops E2E runner", "idempotency_key": f"delivery-{run_id}"},
         )
         require(donation["status"] == "COMPLETED" and donation.get("delivery_confirmed_at"), "Delivery confirmation did not complete the donation")
         completion_exec = execution_for(donation.get("agent_executions", []), "dispatch_agent", "completion")
@@ -325,7 +325,7 @@ def run(base_url: str, timeout: float) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run one real, synthetic AnnaOps workflow through the local API.")
+    parser = argparse.ArgumentParser(description="Run one real, synthetic अन्न ops workflow through the local API.")
     parser.add_argument("--scenario", default=SCENARIO, choices=[SCENARIO])
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--timeout", type=float, default=90.0)

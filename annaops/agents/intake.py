@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
@@ -87,16 +87,26 @@ class IntakeAgent:
         }
 
     def _extract_with_llm(self, message: str, donation_id: str | None = None) -> tuple[ExtractedOffer, LLMInvocation]:
+        submission_at = datetime.now(self.config.timezone).replace(microsecond=0)
         prompt = (
-            "You are the AnnaOps Intake Agent. Extract only explicitly stated surplus-food donation facts. "
+            "You are the अन्न ops Intake Agent. Extract only explicitly stated surplus-food donation facts. "
             "Never invent values. Preserve each quantity, unit, and food item as its own food_items entry. "
             "Use null for missing facts, record supplied field names in explicit_fields, distinguish any inference "
             "in inferred_fields, flag ambiguity in contradictions, ask only concise questions needed to resolve "
-            "missing or ambiguous facts, and use ISO-8601 timestamps. Do not make a food-safety decision."
+            "missing or ambiguous facts, and use ISO-8601 timestamps. Resolve relative dates and times against "
+            "the supplied submission context. In this application, IST means India Standard Time (Asia/Kolkata, "
+            "UTC+05:30), never Israel Standard Time. Do not make a food-safety decision."
         )
         kwargs: dict[str, Any] = {
             "system_prompt": prompt,
-            "user_payload": {"original_donor_message": message},
+            "user_payload": {
+                "original_donor_message": message,
+                "submission_context": {
+                    "submitted_at": submission_at.isoformat(),
+                    "timezone": self.config.timezone_name,
+                    "timezone_abbreviation": "IST" if self.config.timezone_name == "Asia/Kolkata" else None,
+                },
+            },
         }
         if donation_id and isinstance(self.llm, StructuredLLMClient):
             kwargs.update(donation_id=donation_id, agent_type="intake_agent", workflow_stage="intake")
@@ -104,8 +114,131 @@ class IntakeAgent:
         result = ExtractedOffer.model_validate(invocation.output)
         payload = result.model_dump()
         payload["extraction_source"] = "configured_llm"
-        finalized = self._finalize(ExtractedOffer.model_validate(payload))
+        normalized_storage = self._normalize_explicit_storage(
+            ExtractedOffer.model_validate(payload), message
+        )
+        normalized = self._normalize_message_datetimes(
+            normalized_storage, message, submission_at
+        )
+        finalized = self._finalize(normalized)
         return finalized, invocation
+
+    @staticmethod
+    def _normalize_explicit_storage(offer: ExtractedOffer, message: str) -> ExtractedOffer:
+        """Preserve an unambiguous canonical storage phrase stated by the donor."""
+        patterns = {
+            "kept hot": r"\bkept\s+hot\b",
+            "refrigerated": r"\brefrigerated\b",
+            "chilled": r"\bchilled\b",
+            "frozen": r"\bfrozen\b",
+            "room temperature": r"\broom\s+temperature\b",
+        }
+        stated = [value for value, pattern in patterns.items() if re.search(pattern, message, re.IGNORECASE)]
+        if len(stated) != 1:
+            return offer
+        payload = offer.model_dump()
+        payload["storage_conditions"] = stated[0]
+        explicit = list(payload.get("explicit_fields") or [])
+        if "storage_conditions" not in explicit:
+            explicit.append("storage_conditions")
+        payload["explicit_fields"] = explicit
+        return ExtractedOffer.model_validate(payload)
+
+    def _normalize_message_datetimes(
+        self,
+        offer: ExtractedOffer,
+        message: str,
+        submission_at: datetime,
+    ) -> ExtractedOffer:
+        """Resolve donor-stated local and relative times against the submission clock."""
+        local_reference = (
+            submission_at.astimezone(self.config.timezone)
+            if submission_at.tzinfo
+            else submission_at.replace(tzinfo=self.config.timezone)
+        )
+        payload = offer.model_dump()
+        inferred = list(payload.get("inferred_fields") or [])
+
+        prepared_relative = re.search(
+            r"\b(?:prepared|cooked)\b[^.]{0,80}?\b(\d+)\s*(minute|hour)s?\s+ago\b",
+            message,
+            re.IGNORECASE,
+        )
+        pickup_relative = re.search(
+            r"\b(?:collect|pickup)\b[^.]{0,100}?\bwithin\s+(?:the\s+)?next\s+(\d+)\s*(minute|hour)s?\b",
+            message,
+            re.IGNORECASE,
+        )
+
+        if prepared_relative:
+            amount = int(prepared_relative.group(1))
+            delta = timedelta(**{f"{prepared_relative.group(2).lower()}s": amount})
+            payload["prepared_at"] = local_reference - delta
+            self._append_inference(inferred, "prepared_at.resolved_from_submission_time")
+        else:
+            prepared_clock = self._stated_clock(message, r"\b(?:prepared|cooked)\b")
+            if prepared_clock:
+                payload["prepared_at"] = self._local_datetime_from_clock(message, prepared_clock, local_reference)
+                self._append_inference(inferred, "prepared_at.timezone_normalized_to_configuration")
+
+        if pickup_relative:
+            amount = int(pickup_relative.group(1))
+            delta = timedelta(**{f"{pickup_relative.group(2).lower()}s": amount})
+            payload["pickup_deadline"] = local_reference + delta
+            self._append_inference(inferred, "pickup_deadline.resolved_from_submission_time")
+        else:
+            pickup_clock = self._stated_clock(message, r"\b(?:collect|pickup)\b[^.]{0,100}?\bby\b")
+            if pickup_clock:
+                payload["pickup_deadline"] = self._local_datetime_from_clock(message, pickup_clock, local_reference)
+                self._append_inference(inferred, "pickup_deadline.timezone_normalized_to_configuration")
+
+        payload["inferred_fields"] = inferred
+        return ExtractedOffer.model_validate(payload)
+
+    @staticmethod
+    def _stated_clock(message: str, prefix: str) -> re.Match[str] | None:
+        return re.search(
+            prefix
+            + r"[^.]{0,140}?(?P<hour>\d{1,2})(?::(?P<minute>[0-5]\d))?\s*"
+              r"(?P<meridiem>a\.?m\.?|p\.?m\.?)\s*(?P<timezone>IST)?\b",
+            message,
+            re.IGNORECASE,
+        )
+
+    def _local_datetime_from_clock(
+        self,
+        message: str,
+        clock: re.Match[str],
+        local_reference: datetime,
+    ) -> datetime:
+        hour = int(clock.group("hour"))
+        if not 1 <= hour <= 12:
+            raise ValueError(f"Invalid stated hour: {hour}")
+        minute = int(clock.group("minute") or 0)
+        meridiem = clock.group("meridiem").lower().replace(".", "")
+        hour = (hour % 12) + (12 if meridiem == "pm" else 0)
+        stated_date = self._stated_date(message) or local_reference.date()
+        return datetime.combine(stated_date, datetime.min.time(), self.config.timezone).replace(
+            hour=hour, minute=minute
+        )
+
+    @staticmethod
+    def _stated_date(message: str):
+        match = re.search(
+            r"\b(\d{1,2})\s+"
+            r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+            r"(\d{4})\b",
+            message,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return datetime.strptime(" ".join(match.groups()), "%d %B %Y").date()
+
+    @staticmethod
+    def _append_inference(inferred: list[str], value: str) -> None:
+        if value not in inferred:
+            inferred.append(value)
 
     def merge_clarification(
         self,

@@ -32,7 +32,7 @@ def seed(with_scenarios: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Seed AnnaOps synthetic demo data")
+    parser = argparse.ArgumentParser(description="Seed अन्न ops synthetic demo data")
     parser.add_argument("--with-scenarios", action="store_true", help="Also seed three clearly synthetic offers")
     arguments = parser.parse_args()
     seed(arguments.with_scenarios)

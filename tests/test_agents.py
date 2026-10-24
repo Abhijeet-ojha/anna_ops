@@ -192,6 +192,78 @@ def test_informal_clarification_times_use_configured_local_submission_date(test_
     assert merged.food_items == current.food_items
 
 
+def test_intake_normalizes_india_ist_wall_clock_instead_of_israel_offset(test_settings: Settings):
+    agent = IntakeAgent(test_settings)
+    submission = datetime(2026, 10, 24, 14, 45, tzinfo=test_settings.timezone)
+    provider_offer = ExtractedOffer(
+        food_type="paneer curry",
+        food_items=[{"name": "paneer curry", "quantity": 20, "unit": "kg", "category": "vegetarian"}],
+        food_category="vegetarian",
+        prepared_at=datetime(2026, 10, 24, 12, 20, tzinfo=UTC),
+        pickup_deadline=datetime(2026, 10, 24, 15, 30, tzinfo=UTC),
+        storage_conditions="kept hot",
+        donor_location="Demo Campus Jaipur",
+    )
+    message = (
+        "I have 20 kg of paneer curry. The food category is vegetarian. "
+        "It was prepared today, 24 October 2026, at 2:20 PM IST and has been kept hot. "
+        "Please collect it by 5:30 PM IST from Demo Campus Jaipur."
+    )
+
+    normalized = agent._normalize_message_datetimes(provider_offer, message, submission)
+
+    assert normalized.prepared_at.isoformat() == "2026-10-24T14:20:00+05:30"
+    assert normalized.pickup_deadline.isoformat() == "2026-10-24T17:30:00+05:30"
+    assert "prepared_at.timezone_normalized_to_configuration" in normalized.inferred_fields
+    assert "pickup_deadline.timezone_normalized_to_configuration" in normalized.inferred_fields
+
+
+def test_intake_resolves_relative_times_from_submission_clock(test_settings: Settings):
+    agent = IntakeAgent(test_settings)
+    submission = datetime(2026, 10, 24, 14, 45, tzinfo=test_settings.timezone)
+    provider_offer = ExtractedOffer(
+        food_type="paneer curry",
+        food_items=[{"name": "paneer curry", "quantity": 20, "unit": "kg", "category": "vegetarian"}],
+        food_category="vegetarian",
+        prepared_at=datetime(2026, 10, 24, 0, 0, tzinfo=UTC),
+        pickup_deadline=datetime(2026, 10, 24, 3, 0, tzinfo=UTC),
+        storage_conditions="kept hot",
+        donor_location="Demo Campus Jaipur",
+    )
+    message = (
+        "I have 20 kg of paneer curry. It was prepared 20 minutes ago and kept hot. "
+        "Please collect it within the next 3 hours from Demo Campus Jaipur."
+    )
+
+    normalized = agent._normalize_message_datetimes(provider_offer, message, submission)
+
+    assert normalized.prepared_at.isoformat() == "2026-10-24T14:25:00+05:30"
+    assert normalized.pickup_deadline.isoformat() == "2026-10-24T17:45:00+05:30"
+    assert "prepared_at.resolved_from_submission_time" in normalized.inferred_fields
+    assert "pickup_deadline.resolved_from_submission_time" in normalized.inferred_fields
+
+
+def test_intake_preserves_explicit_kept_hot_phrase_when_provider_shortens_it(test_settings: Settings):
+    agent = IntakeAgent(test_settings)
+    provider_offer = ExtractedOffer(
+        food_type="paneer curry",
+        food_items=[{"name": "paneer curry", "quantity": 20, "unit": "kg", "category": "vegetarian"}],
+        food_category="vegetarian",
+        prepared_at=datetime(2026, 10, 24, 14, 20, tzinfo=test_settings.timezone),
+        pickup_deadline=datetime(2026, 10, 24, 17, 30, tzinfo=test_settings.timezone),
+        storage_conditions="hot",
+        donor_location="Demo Campus Jaipur",
+    )
+
+    normalized = agent._normalize_explicit_storage(
+        provider_offer,
+        "The paneer curry has been kept hot since it was prepared.",
+    )
+
+    assert normalized.storage_conditions == "kept hot"
+    assert "storage_conditions" in normalized.explicit_fields
+
+
 def test_unsupported_storage_clarification_is_rejected(test_settings: Settings):
     agent = IntakeAgent(test_settings)
     current = agent.extract("20 portions vegetarian rice")

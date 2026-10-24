@@ -36,7 +36,7 @@ async function loadMetrics() {
     ["BLOCKED_OR_REVIEW", "Blocked / review"], ["ELIGIBLE_AWAITING_APPROVAL", "Awaiting approval"],
     ["PENDING_NGO_RESPONSE", "NGO pending"], ["ACCEPTED_AWAITING_DELIVERY", "Awaiting delivery"],
     ["COMPLETED_DEMO_DELIVERIES", "Completed demo"], ["ESCALATED_CASES", "Escalated"],
-    ["GEMINI_REQUESTS", "Gemini requests"], ["GEMINI_RATE_LIMIT_ERRORS", "Rate-limit errors"],
+    ["LLM_REQUESTS", "LLM requests"], ["LLM_RATE_LIMIT_ERRORS", "Rate-limit errors"],
   ];
   $("#metrics").innerHTML = groups.map(([key, label]) => `<div class="metric"><strong>${data[key] || 0}</strong><span>${label}</span></div>`).join("");
 }
@@ -177,7 +177,7 @@ function renderAgentExecutions(executions) {
     const evidenceList = (output.evidence || []).map(item => `<li>${esc(item)}</li>`).join("");
 
     const retryGuidance = category === "configuration_error"
-      ? `Verify that ${execution.provider === "groq" ? "GROQ_API_KEY" : "ANNAOPS_GEMINI_API_KEY"} is configured with access to ${execution.model || "the recorded model"}.`
+      ? `Verify that the configured provider API key has access to ${execution.model || "the recorded model"}.`
       : category === "retryable_provider_error"
       ? "The provider is temporarily rate-limited or unreachable. Safe to retry when service recovers."
       : category === "structured_output_validation_failure"

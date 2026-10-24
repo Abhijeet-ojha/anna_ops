@@ -1,14 +1,14 @@
-# AnnaOps: Surplus-Food Donation Coordination with OpenAI-Compatible LLM Providers
+# अन्न ops: Surplus-Food Donation Coordination with OpenAI-Compatible LLM Providers
 
-AnnaOps is a local-first, agentic surplus-food donation coordination system. It transforms raw donor messages into structured, validated food donation offers, enforces authoritative deterministic food safety rules, dynamically reasons over eligible receiver organizations, requests donor approval, simulates NGO responses, replans failed attempts, and maintains an immutable audit trail.
+अन्न ops is a local-first, agentic surplus-food donation coordination system. It transforms raw donor messages into structured, validated food donation offers, enforces authoritative deterministic food safety rules, dynamically reasons over eligible receiver organizations, requests donor approval, simulates NGO responses, replans failed attempts, and maintains an immutable audit trail.
 
-> **Important:** Every NGO, geographic coordinate, dispatch notification, and delivery confirmation in this repository is synthetic. AnnaOps is a safe simulation system for agentic workflow orchestration and evaluation.
+> **Important:** Every NGO, geographic coordinate, dispatch notification, and delivery confirmation in this repository is synthetic. अन्न ops is a safe simulation system for agentic workflow orchestration and evaluation.
 
 ---
 
 ## Architecture & Configured LLM Integration
 
-AnnaOps uses the configured OpenAI-compatible provider for all designated agent operations. Groq is selected when `GROQ_API_KEY` is present; otherwise Gemini remains supported. Silent fallback to deterministic parsing or predetermined agent decisions is strictly prohibited.
+अन्न ops uses the configured OpenAI-compatible provider for all designated agent operations. Groq is selected when `GROQ_API_KEY` is present; otherwise Gemini remains supported. Silent fallback to deterministic parsing or predetermined agent decisions is strictly prohibited.
 
 ### Canonical Configuration
 
@@ -56,7 +56,7 @@ Conflicting defaults (such as `gemini-2.5-flash` or `gemini-3.8-flash`) have bee
 
 ## Safe, Recoverable Error Handling
 
-When an LLM provider error occurs, AnnaOps guarantees safe, non-corrupting behavior:
+When an LLM provider error occurs, अन्न ops guarantees safe, non-corrupting behavior:
 - **Missing API key or invalid model:** Fails application startup with actionable error guidance.
 - **Provider unreachable / Rate limit (429) / Timeout:** Raises `LLMRetryableError` (HTTP 503 `retryable_provider_error`).
 - **Malformed structured response:** Raises `LLMResponseError` (HTTP 502 `invalid_model_output`).
@@ -153,7 +153,7 @@ The runner verifies redacted provider readiness and seeded synthetic demand, sub
 
 ## Deployment Configuration
 
-When deploying AnnaOps to hosted environments (e.g., Cloud Run, Render, Railway, AWS ECS):
+When deploying अन्न ops to hosted environments (e.g., Cloud Run, Render, Railway, AWS ECS):
 1. **Never commit `.env` to version control.**
 2. Configure environment variables in the hosting dashboard:
    - `ANNAOPS_GEMINI_API_KEY`: Your production Google AI Studio key.
@@ -167,7 +167,7 @@ When deploying AnnaOps to hosted environments (e.g., Cloud Run, Render, Railway,
 
 ## Running Automated Tests
 
-AnnaOps features a comprehensive test suite covering mandatory Gemini configuration, error handling, safety, and agent workflows.
+अन्न ops features a comprehensive test suite covering mandatory Gemini configuration, error handling, safety, and agent workflows.
 
 ### 1. Default Offline Test Suite (Using Injected Mock Client)
 The automated test suite runs completely offline with mocked HTTP responses and test-only client injection (`TestMockClient`). No live API credits or internet connectivity are required:

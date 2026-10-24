@@ -89,7 +89,7 @@ class Settings:
                 )
         if errors:
             raise ConfigurationError(
-                f"AnnaOps startup failed due to missing or invalid {provider} configuration:\n"
+                f"अन्न ops startup failed due to missing or invalid {provider} configuration:\n"
                 + "\n".join(f"  - {error}" for error in errors)
             )
 
