@@ -9,11 +9,13 @@ from fastapi.testclient import TestClient
 from annaops.agents.intake import IntakeAgent
 from annaops.agents.matching import FICTIONAL_NGOS, MatchRouteAgent
 from annaops.agents.receiver_advisor import ReceiverAdvisorAgent
-from annaops.config import Settings
+from annaops.config import CANONICAL_MODEL, Settings
 from annaops.db import Database
-from annaops.llm import LLMInvocation
+from annaops.llm import LLMInvocation, LLMResponseError
 from annaops.main import create_app
 from annaops.schemas import AgentDecision, ExtractedOffer
+from annaops.agents.runtime import AgentProtocolError
+import pytest
 from tests.conftest import complete_message
 
 
@@ -42,7 +44,7 @@ class SequenceClient:
     def complete_structured(self, output_model, *, system_prompt, user_payload):
         self.calls.append({"system_prompt": system_prompt, "user_payload": user_payload})
         output = output_model.model_validate(self.outputs.pop(0))
-        return LLMInvocation(output=output, provider=self.provider, model="mock-agent-model", duration_ms=3)
+        return LLMInvocation(output=output, provider=self.provider, model=CANONICAL_MODEL, duration_ms=3)
 
 
 def llm_settings(test_settings: Settings) -> Settings:
@@ -50,7 +52,8 @@ def llm_settings(test_settings: Settings) -> Settings:
         **test_settings.__dict__,
         "llm_api_key": "secret-test-key",
         "llm_base_url": "https://mock.provider/v1",
-        "llm_model": "mock-agent-model",
+        "llm_model": CANONICAL_MODEL,
+        "testing_mode": False,
     })
 
 
@@ -100,13 +103,13 @@ def test_configured_intake_really_invokes_provider_and_validates(monkeypatch, te
     result, trace = IntakeAgent(config).extract_with_trace(complete_message(config))
 
     assert captured["url"] == "https://mock.provider/v1/chat/completions"
-    assert captured["body"]["model"] == "mock-agent-model"
+    assert captured["body"]["model"] == CANONICAL_MODEL
     assert captured["body"]["response_format"]["type"] == "json_schema"
     assert captured["body"]["response_format"]["json_schema"]["name"] == "extractedoffer"
     assert result.extraction_source == "configured_llm"
     assert result.food_items[0].quantity == 40
     assert trace["mode"] == "llm"
-    assert trace["model"] == "mock-agent-model"
+    assert trace["model"] == CANONICAL_MODEL
 
 
 def test_llm_cannot_hide_required_missing_fields(monkeypatch, test_settings: Settings):
@@ -134,19 +137,15 @@ def test_llm_cannot_hide_required_missing_fields(monkeypatch, test_settings: Set
     assert result.clarification_questions
 
 
-def test_malformed_llm_output_triggers_honest_safe_fallback(monkeypatch, test_settings: Settings):
+def test_malformed_llm_output_raises_explicit_error(monkeypatch, test_settings: Settings):
     config = llm_settings(test_settings)
     monkeypatch.setattr(
         "urllib.request.urlopen",
         lambda *args, **kwargs: FakeHTTPResponse({"choices": [{"message": {"content": "not-json"}}]}),
     )
 
-    result, trace = IntakeAgent(config).extract_with_trace(complete_message(config))
-
-    assert result.extraction_source == "llm_error"
-    assert trace["mode"] == "deterministic_fallback"
-    assert trace["error"]["type"] == "LLMResponseError"
-    assert any("configured model" in question for question in result.clarification_questions)
+    with pytest.raises(LLMResponseError):
+        IntakeAgent(config).extract_with_trace(complete_message(config))
 
 
 def test_receiver_agent_uses_tools_then_adapts_to_results(tmp_path: Path, test_settings: Settings):
@@ -179,7 +178,7 @@ def test_receiver_agent_uses_tools_then_adapts_to_results(tmp_path: Path, test_s
     assert client.calls[1]["user_payload"]["tool_results_so_far"]
 
 
-def test_invalid_model_receiver_action_is_rejected_and_falls_back(tmp_path: Path, test_settings: Settings):
+def test_invalid_model_receiver_action_raises_agent_protocol_error(tmp_path: Path, test_settings: Settings):
     config = Settings(**{**llm_settings(test_settings).__dict__, "database_path": tmp_path / "invalid-action.db"})
     database = Database(config)
     database.initialize()
@@ -192,14 +191,10 @@ def test_invalid_model_receiver_action_is_rejected_and_falls_back(tmp_path: Path
         ]),
         decision("recommend_receiver", arguments={"selected_ngo_id": "ngo-08"}),
     ])
-    advisor = ReceiverAdvisorAgent(database, config)
-    advisor.runtime.client = client
+    advisor = ReceiverAdvisorAgent(database, config, client=client)
 
-    advice = advisor.recommend(database.get_donation(donation["id"]), offer)
-
-    assert advice.selected_ngo_id != "ngo-08"
-    assert advice.trace["mode"] == "deterministic_fallback"
-    assert advice.trace["error"]["type"] == "AgentProtocolError"
+    with pytest.raises(AgentProtocolError, match="outside the authoritative eligible set"):
+        advisor.recommend(database.get_donation(donation["id"]), offer)
 
 
 def test_replanning_tools_exclude_attempted_receiver(tmp_path: Path, test_settings: Settings):
@@ -244,7 +239,8 @@ def test_agent_executions_survive_application_restart(tmp_path: Path, test_setti
 def test_dashboard_explicitly_renders_llm_and_fallback_modes():
     source = Path("static/app.js").read_text(encoding="utf-8")
     assert 'mode === "llm"' in source
-    assert "deterministic_fallback" in source
+    assert "llm-success" in source
+    assert "llm-failed" in source
     assert "Actual tool sequence" in source
 
 
@@ -258,5 +254,5 @@ def test_gemini_environment_is_the_first_class_provider(monkeypatch):
     config = Settings.from_env()
 
     assert config.llm_api_key == "gemini-test-key"
-    assert config.llm_model == "gemini-3.8-flash"
+    assert config.llm_model == CANONICAL_MODEL
     assert config.llm_base_url == "https://generativelanguage.googleapis.com/v1beta/openai"

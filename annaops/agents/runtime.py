@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -6,7 +6,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, ValidationError
 
 from annaops.config import Settings, settings
-from annaops.llm import LLMInvocation, StructuredLLMClient
+from annaops.llm import LLMInvocation, StructuredLLMClient, TestMockClient
 from annaops.schemas import AgentDecision
 
 
@@ -15,7 +15,13 @@ class NoArguments(BaseModel):
 
 
 class AgentProtocolError(RuntimeError):
-    pass
+    """Model proposed an invalid action, unknown tool, or exhausted iterations."""
+    category = "agent_protocol_failure"
+
+
+class AgentExecutionLimitError(AgentProtocolError):
+    """Agent reached the maximum iteration limit without a valid final decision."""
+    category = "agent_execution_limit_failure"
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,10 @@ class BoundedToolRuntime:
 
     def __init__(self, config: Settings = settings, client: StructuredLLMClient | None = None):
         self.config = config
-        self.client = client or StructuredLLMClient(config)
+        if client is None and getattr(config, "testing_mode", False):
+            self.client = TestMockClient(config)
+        else:
+            self.client = client or StructuredLLMClient(config)
 
     def run(
         self,
@@ -111,4 +120,4 @@ class BoundedToolRuntime:
             if missing_tools:
                 raise AgentProtocolError(f"Model decided before required tools ran: {sorted(missing_tools)}")
             return RuntimeOutcome(decision=decision, tool_events=tool_events, invocations=invocations)
-        raise AgentProtocolError("Agent iteration limit reached before a valid terminal decision")
+        raise AgentExecutionLimitError("Agent iteration limit reached before a valid terminal decision")

@@ -1,22 +1,23 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 
 def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
-    """Build an evidence-based workflow monitor from persisted records and audit events."""
-    events = donation.get("audit_events") or []
+    events = donation.get("audit_events", [])
+    current_status = donation["status"]
     parsed = donation.get("parsed") or {}
     safety = donation.get("safety") or {}
     match = donation.get("match") or {}
-    approvals = donation.get("approval_decisions") or []
+    approvals = donation.get("approvals") or []
     attempts = donation.get("dispatch_attempts") or []
-    current_status = donation["status"]
 
-    def latest(*event_types: str) -> dict[str, Any] | None:
-        allowed = set(event_types)
-        return next((event for event in reversed(events) if event["event_type"] in allowed), None)
+    def latest(*types: str) -> dict[str, Any] | None:
+        for event in reversed(events):
+            if event["event_type"] in types:
+                return event
+        return None
 
     stages: list[dict[str, Any]] = []
 
@@ -25,11 +26,16 @@ def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
         event: dict[str, Any] | None = None, input_data: Any = None,
         output_data: Any = None, fallback: str | None = None,
     ) -> None:
-        timestamp = event["created_at"] if event else None
-        previous_timestamp = next((item["timestamp"] for item in reversed(stages) if item["timestamp"]), None)
+        timestamp = (event.get("created_at") or event.get("timestamp")) if event else None
+        previous_timestamp = stages[-1]["timestamp"] if stages else None
         duration_ms = None
         if timestamp and previous_timestamp:
-            duration_ms = max(0, round((datetime.fromisoformat(timestamp) - datetime.fromisoformat(previous_timestamp)).total_seconds() * 1000))
+            try:
+                t1 = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                t2 = datetime.fromisoformat(previous_timestamp.replace("Z", "+00:00"))
+                duration_ms = max(0, round((t1 - t2).total_seconds() * 1000))
+            except Exception:
+                duration_ms = None
         stages.append({
             "key": key, "label": label, "component": component, "status": status,
             "explanation": explanation, "timestamp": timestamp, "duration_ms": duration_ms,
@@ -43,17 +49,18 @@ def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
         input_data=donation["original_message"], output_data={"donation_id": donation["id"]},
     )
 
-    intake_event = latest("INTAKE_PARSED", "INTAKE_CLARIFICATION_REQUIRED")
+    intake_event = latest("INTAKE_PARSED", "INTAKE_CLARIFICATION_REQUIRED", "INTAKE_FAILED")
     intake_status = "completed" if parsed else ("failed" if current_status == "ERROR" else "pending")
+    source_name = "Gemini 3.6 Flash" if parsed.get("extraction_source") == "configured_llm" else parsed.get("extraction_source", "unknown")
     intake_explanation = (
-        f"Extracted {len(parsed.get('food_items') or []) or 1} structured food line(s) using {parsed.get('extraction_source', 'unknown source')}."
-        if parsed else "Waiting for structured extraction."
+        f"Extracted {len(parsed.get('food_items') or []) or 1} structured food line(s) using {source_name}."
+        if parsed else ("Extraction failed; preserved safely for retry." if current_status == "ERROR" else "Waiting for structured extraction.")
     )
     fallback = None
     if parsed.get("extraction_source") == "deterministic_demo":
-        fallback = "Configured LLM unavailable or not configured; labelled deterministic demo parser used."
-    elif parsed.get("extraction_source") == "llm_error":
-        fallback = "Configured LLM failed; workflow stopped for confirmation."
+        fallback = "Configured LLM unavailable; labelled demo parser used."
+    elif current_status == "ERROR" and not parsed:
+        fallback = f"LLM extraction failed: {donation.get('error_message') or 'Check agent executions'}"
     add(
         "intake", "Intake Agent", "Language extraction", intake_status, intake_explanation,
         intake_event, input_data=donation["original_message"],
@@ -99,12 +106,14 @@ def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
         output_data={"verdict": safety.get("verdict"), "rule_version": safety.get("rule_version")} if safety else None,
     )
 
-    match_event = latest("MATCHING_COMPLETED", "NGO_DECLINED_REPLANNED", "NGO_TIMEOUT_REPLANNED")
+    match_event = latest("MATCHING_COMPLETED", "NGO_DECLINED_REPLANNED", "NGO_TIMEOUT_REPLANNED", "MATCHING_FAILED")
     candidates = match.get("candidates") or []
     exclusions = match.get("exclusions") or {}
     if match:
         match_status = "completed" if candidates else "blocked"
         match_explanation = f"Ranked {len(candidates)} eligible receiver(s); documented {len(exclusions)} exclusion(s)."
+    elif current_status == "ERROR" and parsed and not match:
+        match_status, match_explanation = "failed", f"Receiver recommendation failed: {donation.get('error_message') or 'Check agent executions'}"
     elif safety and safety.get("verdict") != "SAFE_TO_PROCEED_TO_MATCHING":
         match_status, match_explanation = "blocked", "Matching did not run because the safety gate did not pass."
     else:

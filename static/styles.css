@@ -79,3 +79,20 @@ textarea { resize: vertical; line-height: 1.55; } textarea:focus, input:focus, s
 @media (max-width: 600px) { .shell { width: min(100% - 24px, 1400px); }.topbar { padding: 0 14px; }.top-status .divider, .top-status span:last-child { display: none; }.hero { padding-top: 45px; }.metrics { grid-template-columns: repeat(2, 1fr); }.metric:nth-child(2n) { border-right: 0; }.scenario-grid, .workflow-track { grid-template-columns: 1fr; }.workflow-node:after { display: none !important; }.panel { padding: 20px; }.filters { grid-template-columns: 1fr; }.facts, .evidence-grid { grid-template-columns: 1fr; }.drawer { width: 100vw; }.drawer-header, .drawer-content { padding-left: 17px; padding-right: 17px; }.observatory-heading { flex-direction: column; gap: 10px; }.agent-execution-summary { grid-template-columns: 24px 1fr; padding: 15px 13px; }.agent-execution-summary .mode-badge { grid-column: 2; justify-self: start; }.agent-execution-body { padding: 0 14px 18px 50px; }.execution-meta { display: grid; grid-template-columns: 1fr 1fr; }.execution-meta > span { min-width: 0; }.detail-stage { grid-template-columns: 14px 1fr; }.detail-stage > div:nth-child(3), .detail-stage time { grid-column: 2; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
 
+
+/* Agent Execution Status & Badges */
+.agent-execution.llm-success { border-left-color: #2b7a4b; }
+.agent-execution.llm-failed { border-left-color: #d9383a; }
+.agent-execution.provider-retryable { border-left-color: #d9822b; }
+.agent-execution.test-mock { border-left-color: #7b61ff; }
+.agent-execution.deterministic { border-left-color: #596aad; }
+
+.mode-badge.llm-success { background: #e8f5ec; color: #1e633a; }
+.mode-badge.llm-failed { background: #fde8e8; color: #c82333; }
+.mode-badge.provider-retryable { background: #fef3e2; color: #b25e00; }
+.mode-badge.test-mock { background: #f0edff; color: #5a3ec8; }
+.mode-badge.deterministic { background: #edf0fb; color: #43528a; }
+
+.execution-error-box { margin-top: 14px; padding: 12px 14px; border-radius: 8px; background: #fff5f5; border: 1px solid #ffd4d4; }
+.retry-guidance { margin-top: 8px !important; color: #1e633a !important; font-size: 11px !important; font-weight: 600; }
+.input-summary-box { max-height: 180px; overflow: auto; background: #f4f5f1; padding: 10px 12px; border-radius: 6px; font-size: 11px; white-space: pre-wrap; }

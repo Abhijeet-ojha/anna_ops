@@ -19,7 +19,7 @@ def test_structured_extraction_tracks_explicit_fields(test_settings: Settings):
     assert result.quantity == 40
     assert result.unit == "portions"
     assert result.donor_location == "Demo Campus Jaipur"
-    assert result.extraction_source == "deterministic_demo"
+    assert result.extraction_source == "configured_llm"
     assert result.missing_fields == []
     assert "prepared_at" in result.explicit_fields
 
@@ -87,13 +87,13 @@ def test_missing_coordinates_do_not_fabricate_route(test_settings: Settings):
     assert result.candidates[0].route.distance_km is None
 
 
-def test_configured_llm_failure_falls_back_honestly(monkeypatch, test_settings: Settings):
-    config = Settings(**{**test_settings.__dict__, "llm_api_key": "test", "llm_model": "demo-model"})
+def test_configured_llm_failure_raises_explicit_error(monkeypatch, test_settings: Settings):
+    from annaops.config import CANONICAL_MODEL
+    from annaops.llm import LLMRetryableError
+    config = Settings(**{**test_settings.__dict__, "llm_api_key": "test", "llm_model": CANONICAL_MODEL, "testing_mode": False})
     monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError("offline")))
-    result = IntakeAgent(config).extract(complete_message(config))
-    assert result.extraction_source == "llm_error"
-    assert "failed safely" in (result.notes or "")
-    assert any("configured model" in question for question in result.clarification_questions)
+    with pytest.raises(LLMRetryableError):
+        IntakeAgent(config).extract(complete_message(config))
 
 
 def test_multiple_food_quantities_keep_their_associations(test_settings: Settings):

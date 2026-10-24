@@ -1,207 +1,165 @@
-# AnnaOps
+# AnnaOps: Surplus-Food Donation Coordination Powered by Gemini 3.6 Flash
 
-AnnaOps is a functional, local-first hackathon demonstration of surplus-food donation coordination. It turns a donor message into a validated offer, applies deterministic demo safety rules, ranks fictional receivers, requires explicit donor approval, simulates receiver responses, replans failed attempts, and keeps a durable audit trail.
+AnnaOps is a local-first, agentic surplus-food donation coordination system. It transforms raw donor messages into structured, validated food donation offers, enforces authoritative deterministic food safety rules, dynamically reasons over eligible receiver organizations, requests donor approval, simulates NGO responses, replans failed attempts, and maintains an immutable audit trail.
 
-> **Important:** Every NGO, coordinate, dispatch, response, and delivery confirmation in this repository is synthetic. AnnaOps does not certify food safety and is not connected to a real NGO, courier, or delivery system.
+> **Important:** Every NGO, geographic coordinate, dispatch notification, and delivery confirmation in this repository is synthetic. AnnaOps is a safe simulation system for agentic workflow orchestration and evaluation.
 
-## What is included
+---
 
-- FastAPI backend and responsive Agent Operations dashboard
-- Live persisted workflow monitor with per-stage status, timing, evidence, fallbacks, and human-control gates
-- Interactive Judge Lab that launches five real, synthetic workflow scenarios through the same API used by donor intake
-- LangGraph workflow with distinct intake, safety, and match/route nodes
-- Persisted workflow coordinator that reads durable state and runs only the next permitted LangGraph node
-- Bounded structured-output agent runtime with validated backend-owned tool calls
-- Separate dispatch agent for approval, simulated receiver response, retries, and escalation
-- Pydantic validation and explicit workflow states
-- SQLite persistence for offers, safety assessments, match runs, approvals, attempts, audit events, outcomes, agent executions, action idempotency keys, and atomic creation reservations
-- 12 fictional receiver profiles with capacity, category, availability, operating-hour, and minimum-quantity constraints
-- Optional Gemini structured extraction and agent reasoning, plus optional OSRM routing
-- Labelled deterministic extraction and straight-line routing fallbacks
-- CSV donation records carrying a synthetic-data disclaimer
-- Automated agent, API, failure-path, persistence, and end-to-end tests
+## Architecture & Mandatory Gemini 3.6 Flash Integration
 
-## Quick start (Windows PowerShell)
+In AnnaOps, **Gemini 3.6 Flash** (`gemini-3.6-flash`) is a **mandatory dependency** for all designated agent operations. Silent fallback to deterministic parsing or predetermined agent decisions is strictly prohibited.
 
-Python 3.11+ is recommended.
+### Canonical Configuration
 
+| Setting | Canonical Value / Variable | Purpose |
+| :--- | :--- | :--- |
+| **Provider** | Google Gemini (OpenAI-compatible) | Generative intelligence provider |
+| **Model ID** | `gemini-3.6-flash` (`ANNAOPS_GEMINI_MODEL`) | Strictly required canonical model identifier |
+| **API Key** | `ANNAOPS_GEMINI_API_KEY` | Required API key from Google AI Studio |
+| **Base URL** | `https://generativelanguage.googleapis.com/v1beta/openai` | OpenAI-compatible endpoint root |
+| **Timeout** | `ANNAOPS_LLM_TIMEOUT_SECONDS` (default: `20`) | Strictly bounded per-call model timeout |
+| **Max Iterations** | `ANNAOPS_AGENT_MAX_ITERATIONS` (default: `3`) | Bounded tool-calling execution ceiling |
+
+Conflicting defaults (such as `gemini-2.5-flash` or `gemini-3.8-flash`) have been removed. The application strictly validates this configuration on startup.
+
+---
+
+## Agent Operations Powered by Gemini 3.6 Flash
+
+1. **Intake Agent (`annaops/agents/intake.py`)**:
+   - Uses Gemini 3.6 Flash for structured extraction from natural language donor offers.
+   - Enforces Pydantic schema validation (`ExtractedOffer`) preserving food items, quantities, units, preparation timestamps, storage conditions, and coordinates.
+   - Detects missing facts and contradictory timestamps, formulating targeted clarification questions.
+   - If extraction fails or the provider is unreachable, an explicit failure is raised; silent fallback to a deterministic regex parser is prohibited.
+
+2. **Receiver Advisor Agent (`annaops/agents/receiver_advisor.py`)**:
+   - Executes inside a bounded tool-use runtime (`BoundedToolRuntime`).
+   - Inspects real registered tool outputs (`retrieve_receiver_profiles`, `run_eligibility_and_scoring`, `inspect_previous_attempts`).
+   - Gemini 3.6 Flash analyzes trade-offs and recommends an eligible receiver.
+   - The recommendation is strictly validated against the authoritative eligible candidate set. If the model proposes an ineligible receiver or an invalid action, the operation explicitly fails with `AgentProtocolError`.
+
+3. **Workflow Coordinator (`annaops/agents/coordinator.py`)**:
+   - Uses Gemini 3.6 Flash to inspect persisted workflow state via registered tool `read_persisted_workflow_state` and propose the next workflow operation.
+   - Proposes actions from a bounded set (`run_intake`, `run_safety`, `run_matching`, `durable_pause`).
+   - Authoritative backend code enforces state transition gates, role permissions, and idempotency.
+
+4. **Dispatch & Replanning Agent (`annaops/agents/dispatch.py`)**:
+   - When an NGO declines or times out, Gemini 3.6 Flash evaluates previous attempts, reasons about candidate alternatives, and proposes retry or escalation.
+   - Hard retry limits (`ANNAOPS_MAX_DISPATCH_ATTEMPTS = 2`) and attempted-receiver exclusions are strictly enforced deterministically.
+
+5. **Authoritative Deterministic Controls**:
+   - Food safety rules, temperature/time limits, database transactions, role authorization gates, and state persistence are strictly deterministic. The LLM can never override a safety block, manufacture missing facts, or make an ineligible receiver eligible.
+
+---
+
+## Safe, Recoverable Error Handling
+
+When an LLM provider error occurs, AnnaOps guarantees safe, non-corrupting behavior:
+- **Missing API key or invalid model:** Fails application startup with actionable error guidance.
+- **Provider unreachable / Rate limit (429) / Timeout:** Raises `LLMRetryableError` (HTTP 503 `retryable_provider_error`).
+- **Malformed structured response:** Raises `LLMResponseError` (HTTP 502 `invalid_model_output`).
+- **Invalid agent action / Ineligible receiver proposal:** Raises `AgentProtocolError` (HTTP 502 `agent_protocol_failure`).
+- **Iteration limit exhausted:** Raises `AgentExecutionLimitError` (HTTP 502).
+
+In all failure scenarios:
+- The donation transitions safely to `ERROR` status (`WORKFLOW_ERROR`).
+- An agent execution record is persisted with status `failed`, capturing the provider, model (`gemini-3.6-flash`), error category, and diagnostics.
+- The UI exposes a **Retry Processing** action that triggers `POST /api/donations/{id}/retry` once the provider recovers.
+
+---
+
+## Agent Command Centre (UI)
+
+The UI explicitly visualizes the agentic workflow and distinguishes:
+- **LLM Execution Succeeded** (Green badge, model identifier `gemini-3.6-flash`).
+- **LLM Execution Failed** (Red badge with error category and diagnostic details).
+- **Retryable Provider Failure** (Warning badge with retry guidance and a 1-click Retry button).
+- **Awaiting Human Input** (Purple gate indicator for donor approvals or coordinators).
+- **Deterministic Rule Enforcement** (Blue badge for safety, eligibility, and state transitions).
+
+---
+
+## Quick Start (Local Setup)
+
+### 1. Prerequisites
+- Python 3.11+
+- Google AI Studio Gemini API Key: [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+
+### 2. Installation
 ```powershell
+# Create and activate virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
+# Install dependencies
 python -m pip install -r requirements.txt
-python -m annaops.seed --with-scenarios
-python -m uvicorn annaops.main:app --reload --port 8000
+
+# Configure environment variables
+Copy-Item .env.example .env
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000). API documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+Edit `.env` to supply your API key:
+```env
+ANNAOPS_GEMINI_API_KEY=AIzaSy...
+ANNAOPS_GEMINI_MODEL=gemini-3.6-flash
+ANNAOPS_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+```
 
-If `python` is not on `PATH`, use the full path to a Python 3.11+ executable for the first two commands; after activation, use `.\.venv\Scripts\python.exe`.
-
-## Configure integrations
-
-Copy `.env.example` to `.env`, then load those values into the process environment before starting the server. Uvicorn can do this directly:
-
+### 3. Run Application
 ```powershell
-Copy-Item .env.example .env
+# Start Uvicorn dev server
 .\.venv\Scripts\python.exe -m uvicorn annaops.main:app --env-file .env --port 8000
 ```
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. API Swagger docs are at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-AnnaOps uses Gemini through Google's OpenAI-compatible `POST /chat/completions` endpoint:
+---
 
-- `ANNAOPS_GEMINI_API_KEY`: Gemini API key created in Google AI Studio
-- `ANNAOPS_GEMINI_BASE_URL`: defaults to `https://generativelanguage.googleapis.com/v1beta/openai`
-- `ANNAOPS_GEMINI_MODEL`: defaults to `gemini-3.8-flash` when a Gemini key is present
+## Deployment Configuration
 
-The older `ANNAOPS_LLM_API_KEY`, `ANNAOPS_LLM_BASE_URL`, and `ANNAOPS_LLM_MODEL` variables remain accepted as generic OpenAI-compatible aliases, but Gemini variables take precedence.
+When deploying AnnaOps to hosted environments (e.g., Cloud Run, Render, Railway, AWS ECS):
+1. **Never commit `.env` to version control.**
+2. Configure environment variables in the hosting dashboard:
+   - `ANNAOPS_GEMINI_API_KEY`: Your production Google AI Studio key.
+   - `ANNAOPS_GEMINI_MODEL`: `gemini-3.6-flash`.
+   - `ANNAOPS_GEMINI_BASE_URL`: `https://generativelanguage.googleapis.com/v1beta/openai`.
+   - `ANNAOPS_DATABASE_PATH`: Path to persistent SQLite storage (e.g. `/data/annaops.db`).
+   - `ANNAOPS_TIMEZONE`: e.g. `Asia/Kolkata` or your operational timezone.
+3. If `ANNAOPS_GEMINI_API_KEY` is omitted, the production server will refuse to start and fail with a clear configuration error.
 
-If the key or model is absent, intake uses a limited deterministic parser and labels the result `deterministic_demo`. If a configured model fails or returns malformed data, the parser preserves any facts it can validate, labels the source `llm_error`, and asks the user to confirm them. No fallback is presented as an LLM result.
+---
 
-When configured, the model is used for two tasks where language reasoning adds value:
+## Running Automated Tests
 
-1. Structured multi-item intake extraction and targeted clarification wording.
-2. Receiver recommendation after inspecting live database and authoritative matching tool results.
+AnnaOps features a comprehensive test suite covering mandatory Gemini configuration, error handling, safety, and agent workflows.
 
-The model never writes workflow state directly. Pydantic validates its output, the bounded runtime permits only registered tools, and backend code validates the final action against the current eligible receiver set. Safety, arithmetic, eligibility, transitions, idempotency, approval, and persistence remain deterministic.
-
-Set `ANNAOPS_ROUTING_BASE_URL` to an OSRM-compatible service root to enable road estimates. Without it—or if it fails—the matcher reports either an unverified straight-line distance with no ETA, or `unavailable` when coordinates are missing.
-
-Other settings:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ANNAOPS_DATABASE_PATH` | `data/annaops.db` | SQLite database file |
-| `ANNAOPS_TIMEZONE` | `Asia/Kolkata` | Local input/display timezone |
-| `ANNAOPS_DEMO_MODE` | `true` | Marks created records synthetic |
-| `ANNAOPS_MAX_DISPATCH_ATTEMPTS` | `2` | Escalation retry ceiling |
-| `ANNAOPS_ESCALATION_WINDOW_MINUTES` | `30` | Escalate when too little collection time remains |
-| `ANNAOPS_LLM_TIMEOUT_SECONDS` | `20` | Per-call model timeout |
-| `ANNAOPS_AGENT_MAX_ITERATIONS` | `3` | Hard model/tool loop ceiling |
-
-Never commit a populated `.env` file.
-
-## Initialize and seed
-
-The server automatically creates the schema and idempotently seeds the 12 fictional NGO profiles at startup.
-
+### 1. Default Offline Test Suite (Using Injected Mock Client)
+The automated test suite runs completely offline with mocked HTTP responses and test-only client injection (`TestMockClient`). No live API credits or internet connectivity are required:
 ```powershell
-# Profiles only
-.\.venv\Scripts\python.exe -m annaops.seed
-
-# Profiles plus a complete offer, an incomplete offer, and a scripted safety block
-.\.venv\Scripts\python.exe -m annaops.seed --with-scenarios
+.\.venv\Scripts\pytest
 ```
+All 50 tests will execute and pass deterministically.
 
-Each scenario is explicitly marked synthetic. Running `--with-scenarios` repeatedly creates additional offers by design; profiles remain idempotent.
-
-## Tests
-
+### 2. Opt-in Live Gemini 3.6 Flash Smoke Test
+An explicitly opt-in live test verifies real network connectivity and structured output extraction against Google's Gemini 3.6 Flash endpoint:
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+# Set your real API key in the shell
+$env:ANNAOPS_GEMINI_API_KEY="AIzaSy..."
+
+# Execute the live test
+.\.venv\Scripts\pytest -m live_llm
 ```
 
-Tests use temporary SQLite databases, mocked/unavailable external integrations, and dynamic future timestamps. No API credit or internet connection is required.
+---
 
-Coverage includes extraction validation, missing and contradictory facts, all safety verdicts, category and capacity exclusion, matching and ranking, routing fallback, configured-LLM failure, donor approval enforcement, rejection and timeout replanning, retry escalation, action idempotency, role gates, audit events, CSV export, persistence after app restart, database constraints, and complete success/rejected-first-receiver workflows.
+## API Summary
 
-Agentic tests are separated from live-provider claims. `tests/test_agentic_runtime.py` uses an HTTP mock to prove the configured adapter sends a real chat-completions request and validates the returned structure, plus an injectable mocked model to prove bounded tool selection, tool-result feedback, invalid-action rejection, safe deterministic fallback, attempted-receiver exclusion, observability persistence, and UI mode labelling. These tests do not claim that a live provider was used. A live provider can be exercised by supplying the three LLM environment variables and running the normal workflow; no credential is required for the default test suite.
-
-Creation idempotency is also exercised concurrently: multiple requests with the same key and message resolve to one persisted donation, while reusing a key for different content is rejected. A different key deliberately permits a genuinely new donation, even when its donor message is identical.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A[Donor message] --> B[Intake Agent]
-    B --> C{Facts complete?}
-    C -- no --> D[Clarification]
-    D --> B
-    C -- yes --> E[Deterministic Safety Agent]
-    E -- blocked/review --> F[Stop or human review]
-    E -- eligible --> G[Match & Route Agent]
-    G --> H[Ranked proposal]
-    H --> I{Donor approves?}
-    I -- no --> J[Donor rejected]
-    I -- yes --> K[Simulated NGO inbox]
-    K -- accept --> L[Arrangement accepted]
-    K -- decline/timeout --> M{Retry allowed?}
-    M -- yes --> G
-    M -- no --> N[Human escalation]
-    L --> O{Separate delivery confirmation?}
-    O -- no --> L
-    O -- yes --> P[Completed demo record]
-```
-
-The immediate intake-to-proposal path is compiled as a typed LangGraph. A coordinator node reads the current persisted status and selects intake, safety, matching, or a durable pause. Human approval and NGO response are explicit SQLite states and API actions. Page refreshes and process restarts are therefore safe without pretending a long-running in-memory graph survived.
-
-### Agent responsibilities
-
-1. **Intake Agent** extracts only supplied facts, validates the schema, records explicit and inferred fields, and requests targeted clarification.
-2. **Safety Agent** applies versioned Python rules. Missing or unrecognized storage is never silently approved; an LLM cannot override a block.
-3. **Match & Route Agent** applies hard eligibility constraints before explainable scoring and records every receiver exclusion.
-4. **Dispatch Agent** enforces approval, de-duplicates actions, simulates responses, excludes attempted receivers, caps retries, and keeps acceptance distinct from delivery.
-
-### Registered agent tools
-
-The receiver advisor can request only these backend-owned tools:
-
-- `retrieve_receiver_profiles` — reads current capacity, availability, accepted categories, quantity limits, and operating hours.
-- `inspect_previous_attempts` — reads persisted attempts and receiver responses for this donation.
-- `run_eligibility_and_scoring` — applies authoritative eligibility, route estimation, exclusions, and scoring.
-
-The runtime validates tool names and arguments, returns real results to the next bounded model turn, and rejects a final receiver outside the authoritative eligible set. If the provider fails, returns malformed JSON, requests an unknown tool, exceeds the iteration limit, or proposes a forbidden action, AnnaOps records the failure and uses an honestly labelled deterministic fallback.
-
-## API
-
-The principal endpoints are:
-
-- `POST /api/donations`
-- `GET /api/donations`
-- `GET /api/donations/{id}`
-- `GET /api/donations/{id}/workflow`
-- `GET /api/donations/{id}/agent-executions`
-- `POST /api/donations/{id}/clarify`
-- `POST /api/donations/{id}/approve`
-- `POST /api/donations/{id}/reject`
-- `POST /api/donations/{id}/ngo-response`
-- `POST /api/donations/{id}/delivery-confirmation`
-- `POST /api/donations/{id}/escalate`
-- `GET /api/donations/{id}/audit`
-- `GET /api/donations/{id}/record.csv`
-- `POST /api/demo/scenarios/{complete|missing|rejection|safety|escalation}`
-- `GET /api/health`
-
-Mutating bodies accept an optional `idempotency_key`. Donation creation reserves that key and creates the record in one SQLite `BEGIN IMMEDIATE` transaction, so concurrent retries cannot create duplicate records. Replaying the same key with the same message returns the original donation; replaying it with different content returns a validation error. The local demo also applies actor-label role gates (`donor`, `ngo`, or `coordinator`) to catch accidental misuse. These labels are **not authentication** and must be replaced with real identity, authorization, CSRF protection, rate limiting, and deployment controls before any non-local use.
-
-## Judge demonstration
-
-Start the service, open the dashboard, and use the five launchers in **Interactive Judge Lab**. Each creates a durable synthetic record and immediately opens its real workflow evidence; the cards are not scripted animations.
-
-1. **A — Complete lifecycle:** inspect extraction, safety, ranked receivers, exclusions, and route limitation; approve; simulate acceptance; then record the separate delivery confirmation.
-2. **B — Missing information:** inspect explicit and missing fields, submit clarification, and watch validation, safety, and matching resume on the same record.
-3. **C — Rejection & replan:** approve the first proposal, simulate a decline, and show that the attempted receiver is excluded, replanning completes, and the replacement requires fresh donor approval.
-4. **D — Safety review:** show the deterministic review verdict and confirm that matching and dispatch stay blocked.
-5. **E — Retry exhaustion:** approve and fail two simulated attempts to demonstrate the bounded retry policy and human escalation.
-
-For every path, the **Agent Workflow Monitor** and donation drawer are projections of persisted facts, match runs, approvals, attempts, and audit events. They show stage inputs and outputs, elapsed time where available, missing or conflicting facts, safety reasoning, scoring components, all receiver exclusions, integration fallbacks, and explicit human gates.
-
-## Limitations
-
-- The included safety rules are deliberately conservative demo rules, not validated legal or regulatory thresholds. Production criteria require qualified local review.
-- NGOs and coordinates are fictional. Capacity and availability are synthetic database values.
-- Receiver messaging, timeout scheduling, collection, and delivery confirmation are user-driven simulations.
-- The deterministic parser recognizes a narrow set of foods, units, storage phrases, and ISO-8601 timestamps. Configure an LLM for broader language coverage.
-- The deterministic parser preserves multiple explicit `quantity + unit + food` groups as itemized facts. Mixed measurement units are not summed or sent to automatic matching; they require human review.
-- OSRM is optional and no public routing service is enabled by default.
-- SQLite is suitable for a local demo, not a horizontally scaled deployment without additional coordination.
-- Authentication is not implemented. Actor-label role gates are only guardrails for the local UI.
-- Automatic background timeout jobs and production observability are not included.
-
-## Troubleshooting
-
-- **`ZoneInfoNotFoundError` on Windows:** reinstall dependencies; `tzdata` is pinned in `requirements.txt`.
-- **Offer asks for clarification unexpectedly:** include quantity/unit, food, ISO-8601 preparation and pickup timestamps, storage, and a location. Coordinates are optional but needed for route distance.
-- **No receivers are eligible:** inspect the exclusion reasons for capacity, category, operating hours, availability, minimum quantity, or previously attempted IDs.
-- **LLM is labelled `llm_error`:** verify all three LLM variables and provider access. The workflow fails safely into confirmation rather than fabricating output.
-- **Routing says straight-line fallback:** configure a reachable OSRM base URL and supply donor coordinates.
-- **State transition returns HTTP 409:** refresh the record; actions are permitted only from the displayed workflow state.
-
+- `POST /api/donations`: Create and process a donation offer with Gemini 3.6 Flash.
+- `POST /api/donations/{id}/retry`: Authorised retry of a failed donation after provider recovery.
+- `GET /api/donations/{id}/agent-executions`: Full audit trail of agent executions, tool calls, and model outputs.
+- `GET /api/donations/{id}/workflow`: Current 10-stage workflow projection and timing.
+- `POST /api/donations/{id}/approve`: Donor approval gate.
+- `POST /api/donations/{id}/ngo-response`: Simulated receiver response (`accept` / `decline` / `timeout`).
+- `POST /api/donations/{id}/delivery-confirmation`: Final coordinator delivery confirmation.
+- `POST /api/demo/scenarios/{scenario}`: Run interactive Judge Lab demo scenarios (`complete`, `missing`, `rejection`, `safety`, `escalation`).
+- `GET /api/donations/{id}/record.csv`: Export synthetic donation record with disclaimer.

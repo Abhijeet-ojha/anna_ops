@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
@@ -6,12 +6,14 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from annaops.agents.intake import IntakeAgent
 from annaops.agents.coordinator import WorkflowCoordinatorAgent
+from annaops.agents.intake import IntakeAgent
 from annaops.agents.receiver_advisor import ReceiverAdvisorAgent
+from annaops.agents.runtime import AgentProtocolError
 from annaops.agents.safety import SafetyAgent
-from annaops.config import Settings, settings
+from annaops.config import CANONICAL_MODEL, Settings, settings
 from annaops.db import Database
+from annaops.llm import LLMError, StructuredLLMClient
 from annaops.schemas import DonationStatus, ExtractedOffer, SafetyVerdict
 
 
@@ -30,16 +32,17 @@ class WorkflowState(TypedDict, total=False):
 class DonationWorkflow:
     """LangGraph topology for intake, completeness, safety, and matching.
 
-    Human approval and external-response waits are durable API-driven transitions handled by DispatchAgent.
+    Uses Gemini 3.6 Flash for designated LLM operations. Propagates failures
+    safely without silent fallback.
     """
 
-    def __init__(self, database: Database, config: Settings = settings):
+    def __init__(self, database: Database, config: Settings = settings, client: StructuredLLMClient | Any | None = None):
         self.database = database
         self.config = config
-        self.intake_agent = IntakeAgent(config)
+        self.intake_agent = IntakeAgent(config, client=client)
         self.safety_agent = SafetyAgent(config)
-        self.receiver_advisor = ReceiverAdvisorAgent(database, config)
-        self.coordinator = WorkflowCoordinatorAgent(database)
+        self.receiver_advisor = ReceiverAdvisorAgent(database, config, client=client)
+        self.coordinator = WorkflowCoordinatorAgent(database, config, client=client)
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -60,7 +63,7 @@ class DonationWorkflow:
 
     def _coordinator_node(self, state: WorkflowState) -> WorkflowState:
         steps = state.get("coordinator_steps", 0) + 1
-        if steps > 6:
+        if steps > 8:
             raise RuntimeError("Coordinator iteration limit reached")
         operation = self.coordinator.coordinate(state["donation_id"])
         return {**state, "next_operation": operation, "coordinator_steps": steps}
@@ -71,23 +74,49 @@ class DonationWorkflow:
             "run_intake": "intake",
             "run_safety": "safety",
             "run_matching": "match",
-        }.get(state["next_operation"], "stop")
+        }.get(state.get("next_operation", "durable_pause"), "stop")
 
     def process_new(self, donation_id: str, message: str) -> dict[str, Any]:
         self.graph.invoke({"donation_id": donation_id, "original_message": message})
         return self.database.get_donation(donation_id)
 
-    def process_clarification(self, donation_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def retry_processing(self, donation_id: str) -> dict[str, Any]:
+        """Authorized retry of a donation in ERROR status once provider is available."""
         donation = self.database.get_donation(donation_id)
-        if donation["status"] not in {
-            DonationStatus.NEEDS_CLARIFICATION.value,
-            DonationStatus.REQUIRES_HUMAN_REVIEW.value,
-        }:
-            raise ValueError(f"Clarification is not allowed in status {donation['status']}")
+        if donation["status"] != DonationStatus.ERROR.value:
+            raise ValueError(f"Only donations in ERROR status can be retried; current status is {donation['status']}")
+
+        parsed = donation.get("parsed")
+        safety = donation.get("safety")
+
+        if parsed and safety and safety.get("verdict") == SafetyVerdict.SAFE_TO_PROCEED_TO_MATCHING.value:
+            self.database.update_donation(
+                donation_id, DonationStatus.ERROR, DonationStatus.MATCHING,
+                "RETRY_INITIATED", "coordinator", "Authorised retry resuming at matching stage",
+            )
+            self.graph.invoke({
+                "donation_id": donation_id,
+                "original_message": donation["original_message"],
+                "parsed": parsed,
+                "safety": safety,
+                "skip_intake": True,
+            })
+        else:
+            self.database.update_donation(
+                donation_id, DonationStatus.ERROR, DonationStatus.INTAKE_PROCESSING,
+                "RETRY_INITIATED", "coordinator", "Authorised retry resuming at intake stage",
+            )
+            self.graph.invoke({"donation_id": donation_id, "original_message": donation["original_message"]})
+
+        return self.database.get_donation(donation_id)
+
+    def submit_clarification(self, donation_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        donation = self.database.get_donation(donation_id)
+        if donation["status"] != DonationStatus.NEEDS_CLARIFICATION.value:
+            raise ValueError(f"Donation {donation_id} does not require clarification")
         current = ExtractedOffer.model_validate(donation["parsed"])
-        current = self.intake_agent.upgrade_legacy_food_items(current, donation["original_message"])
-        reference_at = datetime.fromisoformat(donation["created_at"])
-        merged = self.intake_agent.merge_clarification(current, fields, reference_at=reference_at)
+        reference = datetime.fromisoformat(donation["created_at"].replace("Z", "+00:00"))
+        merged = self.intake_agent.merge_clarification(current, fields, reference_at=reference)
         self.database.update_donation(
             donation_id, donation["status"], DonationStatus.INTAKE_PROCESSING,
             "CLARIFICATION_SUBMITTED", "donor", "Donor supplied clarification fields",
@@ -105,26 +134,52 @@ class DonationWorkflow:
             started = time.perf_counter()
             parsed = ExtractedOffer.model_validate(state["parsed"])
             trace = {
-                "mode": "deterministic", "provider": None, "model": None,
+                "mode": "deterministic", "provider": "authoritative_schema", "model": None,
                 "duration_ms": round((time.perf_counter() - started) * 1000), "retry_count": 0,
                 "error": None, "structured_output": parsed.model_dump(mode="json"), "tools": [],
                 "selected_action": "request_clarification" if parsed.missing_fields or parsed.contradictions else "submit_for_safety",
             }
         else:
-            parsed, trace = self.intake_agent.extract_with_trace(state["original_message"])
-        needs_clarification = bool(
-            parsed.missing_fields
-            or parsed.contradictions
-            or parsed.extraction_source == "llm_error"
-        )
+            try:
+                parsed, trace = self.intake_agent.extract_with_trace(state["original_message"])
+            except (LLMError, AgentProtocolError) as exc:
+                category = getattr(exc, "category", "unknown")
+                provider = getattr(getattr(self.intake_agent, "llm", None), "provider", "gemini")
+                model = getattr(getattr(self.intake_agent, "llm", None), "config", None) and getattr(self.intake_agent.llm.config, "llm_model", CANONICAL_MODEL) or CANONICAL_MODEL
+
+                self.database.update_donation(
+                    state["donation_id"], donation["status"], DonationStatus.ERROR,
+                    "INTAKE_FAILED", "intake_agent",
+                    f"Intake extraction failed: {type(exc).__name__}",
+                    {"error_type": type(exc).__name__, "category": category},
+                    error_message=str(exc),
+                )
+                self.database.record_agent_execution(
+                    state["donation_id"],
+                    agent_type="intake_agent",
+                    workflow_stage="intake",
+                    objective="Extract explicit donor facts and identify only blocking clarification needs",
+                    execution_mode="failed",
+                    provider=provider,
+                    model=model,
+                    input_summary={"message_length": len(state["original_message"])},
+                    structured_output={},
+                    tools=[],
+                    selected_action="durable_pause",
+                    resulting_status="ERROR",
+                    error={"type": type(exc).__name__, "message": str(exc), "category": category},
+                    duration_ms=0,
+                )
+                raise
+
+        needs_clarification = bool(parsed.missing_fields or parsed.contradictions)
         new_status = DonationStatus.NEEDS_CLARIFICATION if needs_clarification else DonationStatus.PENDING_SAFETY_REVIEW
         updated = self.database.update_donation(
             state["donation_id"], donation["status"], new_status,
             "INTAKE_CLARIFICATION_REQUIRED" if needs_clarification else "INTAKE_PARSED",
             "intake_agent",
             "Critical information is missing or contradictory" if needs_clarification else "Structured extraction validated",
-            {"missing_fields": parsed.missing_fields, "contradictions": parsed.contradictions,
-             "source": parsed.extraction_source},
+            {"missing_fields": parsed.missing_fields, "contradictions": parsed.contradictions, "source": parsed.extraction_source},
             parsed_json=parsed.model_dump(mode="json"),
         )
         self.database.record_agent_execution(
@@ -160,7 +215,10 @@ class DonationWorkflow:
         self.database.record_agent_execution(
             state["donation_id"], agent_type="safety_agent", workflow_stage="safety",
             objective="Apply authoritative versioned food-safety rules",
-            execution_mode="deterministic", input_summary={"parsed_fields": sorted(state["parsed"].keys())},
+            execution_mode="deterministic",
+            provider="rule_engine",
+            model="demo-safety-v1",
+            input_summary={"parsed_fields": sorted(state["parsed"].keys())},
             structured_output=assessment.model_dump(mode="json"),
             tools=[{"sequence": 1, "name": "run_versioned_safety_rules", "arguments": {"rule_version": assessment.rule_version},
                     "purpose": "Produce the authoritative safety verdict", "result": assessment.model_dump(mode="json")}],
@@ -172,7 +230,38 @@ class DonationWorkflow:
 
     def _match_node(self, state: WorkflowState) -> WorkflowState:
         donation = self.database.get_donation(state["donation_id"])
-        advice = self.receiver_advisor.recommend(donation, ExtractedOffer.model_validate(state["parsed"]))
+        try:
+            advice = self.receiver_advisor.recommend(donation, ExtractedOffer.model_validate(state["parsed"]))
+        except (LLMError, AgentProtocolError) as exc:
+            category = getattr(exc, "category", "unknown")
+            provider = getattr(getattr(self.receiver_advisor.runtime, "client", None), "provider", "gemini")
+            model = getattr(getattr(self.receiver_advisor.runtime, "client", None), "config", None) and getattr(self.receiver_advisor.runtime.client.config, "llm_model", CANONICAL_MODEL) or CANONICAL_MODEL
+
+            self.database.update_donation(
+                state["donation_id"], donation["status"], DonationStatus.ERROR,
+                "MATCHING_FAILED", "match_route_agent",
+                f"Receiver recommendation failed: {type(exc).__name__}",
+                {"error_type": type(exc).__name__, "category": category},
+                error_message=str(exc),
+            )
+            self.database.record_agent_execution(
+                state["donation_id"],
+                agent_type="receiver_advisor_agent",
+                workflow_stage="matching",
+                objective="Use live receiver tools and recommend only an authoritatively eligible receiver",
+                execution_mode="failed",
+                provider=provider,
+                model=model,
+                input_summary={"food_category": state["parsed"].get("food_category"), "attempted_ngo_ids": []},
+                structured_output={},
+                tools=[],
+                selected_action="durable_pause",
+                resulting_status="ERROR",
+                error={"type": type(exc).__name__, "message": str(exc), "category": category},
+                duration_ms=0,
+            )
+            raise
+
         result = advice.match
         self.database.add_match_run(state["donation_id"], result.model_dump(mode="json"))
         if not advice.selected_ngo_id:
@@ -201,4 +290,3 @@ class DonationWorkflow:
             started_at=trace.get("started_at"),
         )
         return {**state, "match": result.model_dump(mode="json"), "outcome": new_status}
-

@@ -1,13 +1,15 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
 from typing import Any
 
 from annaops.agents.receiver_advisor import ReceiverAdvisorAgent
+from annaops.agents.runtime import AgentProtocolError
 from annaops.agents.safety import SafetyAgent
-from annaops.config import Settings, settings
+from annaops.config import CANONICAL_MODEL, Settings, settings
 from annaops.db import Database
+from annaops.llm import LLMError, StructuredLLMClient
 from annaops.schemas import AgentDecision, DonationStatus, ExtractedOffer, SafetyVerdict
 
 
@@ -16,13 +18,17 @@ class InvalidTransition(ValueError):
 
 
 class DispatchAgent:
-    """Enforces approval, dispatch, retry, escalation, and delivery-confirmation gates."""
+    """Enforces approval, dispatch, retry, escalation, and delivery-confirmation gates.
 
-    def __init__(self, database: Database, config: Settings = settings):
+    Replanning requires Gemini 3.6 Flash via ReceiverAdvisorAgent. Failures do not
+    silently choose replacement receivers.
+    """
+
+    def __init__(self, database: Database, config: Settings = settings, client: StructuredLLMClient | Any | None = None):
         self.database = database
         self.config = config
         self.safety_agent = SafetyAgent(config)
-        self.receiver_advisor = ReceiverAdvisorAgent(database, config)
+        self.receiver_advisor = ReceiverAdvisorAgent(database, config, client=client)
 
     def approve(self, donation_id: str, actor: str, reason: str | None = None) -> dict[str, Any]:
         started = time.perf_counter()
@@ -127,7 +133,7 @@ class DispatchAgent:
         allowed = {
             DonationStatus.NEEDS_CLARIFICATION, DonationStatus.REQUIRES_HUMAN_REVIEW,
             DonationStatus.AWAITING_DONOR_APPROVAL, DonationStatus.AWAITING_NGO_RESPONSE,
-            DonationStatus.REPLANNING,
+            DonationStatus.REPLANNING, DonationStatus.ERROR,
         }
         self._require(donation, allowed)
         result = self.database.update_donation(
@@ -142,8 +148,13 @@ class DispatchAgent:
         )
         return result
 
-    def _replan_or_escalate(self, donation: dict[str, Any], response: str, actor: str,
-                            reason: str | None) -> dict[str, Any]:
+    def _replan_or_escalate(
+        self,
+        donation: dict[str, Any],
+        response: str,
+        actor: str,
+        reason: str | None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         donation_id = donation["id"]
         remaining_minutes = None
@@ -170,7 +181,36 @@ class DispatchAgent:
             )
             return result
 
-        advice = self.receiver_advisor.recommend(donation, parsed, set(donation["attempted_ngo_ids"]))
+        try:
+            advice = self.receiver_advisor.recommend(donation, parsed, set(donation["attempted_ngo_ids"]))
+        except (LLMError, AgentProtocolError) as exc:
+            self.database.update_donation(
+                donation_id, donation["status"], DonationStatus.ERROR,
+                failure_event + "_REPLAN_FAILED", "system",
+                f"Replanning failed: {type(exc).__name__}",
+                {"attempt_count": donation["attempt_count"], "error_type": type(exc).__name__},
+                error_message=str(exc),
+            )
+            self.database.record_agent_execution(
+                donation_id,
+                agent_type="receiver_advisor_agent",
+                workflow_stage="replanning",
+                objective="Inspect previous attempts and live alternatives after a failed receiver response",
+                execution_mode="failed",
+                provider=getattr(getattr(self.receiver_advisor.runtime, "client", None), "provider", "gemini"),
+                model=getattr(getattr(self.receiver_advisor.runtime, "client", None), "config", None) and getattr(self.receiver_advisor.runtime.client.config, "llm_model", CANONICAL_MODEL) or CANONICAL_MODEL,
+                input_summary={"response": response, "attempted_ngo_ids": donation["attempted_ngo_ids"],
+                               "remaining_minutes": remaining_minutes},
+                structured_output={},
+                tools=[],
+                selected_action="durable_pause",
+                resulting_status="ERROR",
+                error={"type": type(exc).__name__, "message": str(exc), "category": getattr(exc, "category", "unknown")},
+                duration_ms=round((time.perf_counter() - started) * 1000),
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            raise
+
         match = advice.match
         self.database.add_match_run(donation_id, match.model_dump(mode="json"))
         if not advice.selected_ngo_id:
@@ -242,18 +282,20 @@ class DispatchAgent:
                 DonationStatus.AWAITING_DONOR_APPROVAL.value,
                 DonationStatus.AWAITING_NGO_RESPONSE.value,
                 DonationStatus.ACCEPTED.value,
-                DonationStatus.ESCALATED.value,
+                DonationStatus.NEEDS_CLARIFICATION.value,
+                DonationStatus.REQUIRES_HUMAN_REVIEW.value,
             },
             task_complete=True,
         )
+        tools = [
+            {"sequence": i + 1, "name": name, "arguments": {}, "purpose": "Deterministic authoritative gate", "result": "ok"}
+            for i, name in enumerate(tool_names)
+        ]
         self.database.record_agent_execution(
-            donation["id"], agent_type=agent_type, workflow_stage=stage, objective=objective,
-            execution_mode="deterministic", input_summary={"status": donation["status"]},
-            structured_output=decision.model_dump(mode="json"),
-            tools=[{"sequence": index, "name": name, "arguments": {}, "purpose": objective,
-                    "result": {"resulting_status": donation["status"]}}
-                   for index, name in enumerate(tool_names, 1)],
-            selected_action=action, resulting_status=donation["status"],
-            duration_ms=round((time.perf_counter() - started) * 1000),
+            donation["id"], agent_type=agent_type, workflow_stage=stage,
+            objective=objective, execution_mode="deterministic",
+            input_summary={"status": donation["status"], "attempt_count": donation.get("attempt_count", 0)},
+            structured_output=decision.model_dump(mode="json"), tools=tools, selected_action=action,
+            resulting_status=donation["status"], duration_ms=round((time.perf_counter() - started) * 1000),
+            started_at=datetime.now(UTC).isoformat(),
         )
-

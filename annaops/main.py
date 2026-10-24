@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import io
@@ -14,13 +14,22 @@ from fastapi.staticfiles import StaticFiles
 from annaops import __version__
 from annaops.agents.dispatch import DispatchAgent, InvalidTransition
 from annaops.agents.matching import FICTIONAL_NGOS
-from annaops.config import Settings, settings
+from annaops.agents.runtime import AgentExecutionLimitError, AgentProtocolError
+from annaops.config import CANONICAL_MODEL, ConfigurationError, Settings, settings
 from annaops.db import Database
+from annaops.llm import (
+    LLMConfigurationError,
+    LLMError,
+    LLMResponseError,
+    LLMRetryableError,
+    StructuredLLMClient,
+    TestMockClient,
+)
 from annaops.schemas import (
     ActionRequest,
     ClarificationRequest,
-    DemoScenarioRequest,
     DeliveryConfirmationRequest,
+    DemoScenarioRequest,
     DonationCreate,
     NGOResponseRequest,
 )
@@ -28,13 +37,19 @@ from annaops.workflow import DonationWorkflow
 from annaops.projections import project_workflow
 
 
-def create_app(config: Settings = settings) -> FastAPI:
+def create_app(config: Settings = settings, llm_client: StructuredLLMClient | Any | None = None) -> FastAPI:
+    if config.testing_mode and llm_client is None:
+        llm_client = TestMockClient(config)
+
     database = Database(config)
-    workflow = DonationWorkflow(database, config)
-    dispatch = DispatchAgent(database, config)
+    database.initialize()
+    workflow = DonationWorkflow(database, config, client=llm_client)
+    dispatch = DispatchAgent(database, config, client=llm_client)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # Validate mandatory Gemini configuration at application startup
+        config.validate()
         database.initialize()
         database.seed_ngos(FICTIONAL_NGOS)
         yield
@@ -42,9 +57,10 @@ def create_app(config: Settings = settings) -> FastAPI:
     app = FastAPI(
         title="AnnaOps",
         version=__version__,
-        description="Local synthetic demo for surplus-food donation coordination.",
+        description="Surplus-food donation coordination powered by Gemini 3.6 Flash.",
         lifespan=lifespan,
     )
+    app.state.config = config
     app.state.database = database
     app.state.workflow = workflow
     app.state.dispatch = dispatch
@@ -53,46 +69,105 @@ def create_app(config: Settings = settings) -> FastAPI:
     async def not_found_handler(_, exc: KeyError):
         return JSONResponse(status_code=404, content={"error": "not_found", "detail": f"Donation {exc.args[0]} was not found"})
 
+    @app.exception_handler(ValueError)
+    async def value_error_handler(_, exc: ValueError):
+        return JSONResponse(status_code=422, content={"error": "validation_error", "detail": str(exc)})
+
     @app.exception_handler(InvalidTransition)
     async def transition_handler(_, exc: InvalidTransition):
         return JSONResponse(status_code=409, content={"error": "invalid_transition", "detail": str(exc)})
+
+    @app.exception_handler(ConfigurationError)
+    async def config_error_handler(_, exc: ConfigurationError):
+        return JSONResponse(status_code=503, content={
+            "error": "configuration_error",
+            "detail": str(exc),
+            "category": "configuration_error",
+            "retryable": False,
+        })
+
+    @app.exception_handler(LLMConfigurationError)
+    async def llm_config_handler(_, exc: LLMConfigurationError):
+        return JSONResponse(status_code=503, content={
+            "error": "configuration_error",
+            "detail": str(exc),
+            "category": exc.category,
+            "retryable": False,
+            "guidance": "Verify that ANNAOPS_GEMINI_API_KEY is configured with access to gemini-3.6-flash.",
+        })
+
+    @app.exception_handler(LLMRetryableError)
+    async def llm_retryable_handler(_, exc: LLMRetryableError):
+        return JSONResponse(status_code=503, content={
+            "error": "provider_unavailable",
+            "detail": str(exc),
+            "category": exc.category,
+            "retryable": True,
+            "guidance": "The LLM provider is temporarily unavailable or rate-limited. Retry when provider recovers.",
+        })
+
+    @app.exception_handler(LLMResponseError)
+    async def llm_response_handler(_, exc: LLMResponseError):
+        return JSONResponse(status_code=502, content={
+            "error": "invalid_model_output",
+            "detail": str(exc),
+            "category": exc.category,
+            "retryable": True,
+            "guidance": "The model returned an invalid structured output. Retry the operation.",
+        })
+
+    @app.exception_handler(AgentExecutionLimitError)
+    async def agent_limit_handler(_, exc: AgentExecutionLimitError):
+        return JSONResponse(status_code=502, content={
+            "error": "agent_execution_limit_failure",
+            "detail": str(exc),
+            "category": exc.category,
+            "retryable": True,
+            "guidance": "Agent reached the maximum iteration limit without a valid decision. Retry the operation.",
+        })
+
+    @app.exception_handler(AgentProtocolError)
+    async def agent_protocol_handler(_, exc: AgentProtocolError):
+        return JSONResponse(status_code=502, content={
+            "error": "agent_protocol_failure",
+            "detail": str(exc),
+            "category": getattr(exc, "category", "agent_protocol_failure"),
+            "retryable": True,
+            "guidance": "An agent attempted a forbidden action or unknown tool. Retry the operation.",
+        })
 
     @app.exception_handler(RuntimeError)
     async def runtime_handler(_, exc: RuntimeError):
         return JSONResponse(status_code=409, content={"error": "workflow_conflict", "detail": str(exc)})
 
-    @app.exception_handler(ValueError)
-    async def value_handler(_, exc: ValueError):
-        return JSONResponse(status_code=422, content={"error": "invalid_input", "detail": str(exc)})
-
     @app.get("/api/health")
-    def health() -> dict[str, Any]:
+    def health():
         try:
             database.metrics()
             database_status = "ok"
         except Exception:
             database_status = "error"
-        llm_configured = bool(config.llm_api_key and config.llm_model)
-        llm_provider = "gemini" if "generativelanguage.googleapis.com" in config.llm_base_url else "openai_compatible"
+        llm_configured = bool(config.llm_api_key and config.llm_model == CANONICAL_MODEL)
         return {
             "status": "ok" if database_status == "ok" else "degraded",
             "version": __version__,
             "database": database_status,
             "demo_mode": config.demo_mode,
-            "llm": "configured" if llm_configured else "deterministic_demo_fallback",
-            "llm_provider": llm_provider if llm_configured else None,
-            "llm_model": config.llm_model if llm_configured else None,
+            "llm": "configured" if llm_configured else "not_configured",
+            "llm_provider": "gemini",
+            "llm_model": config.llm_model,
+            "canonical_model": CANONICAL_MODEL,
             "agent_runtime": {"max_iterations": config.agent_max_iterations, "timeout_seconds": config.llm_timeout_seconds},
             "routing": "configured_osrm" if config.routing_base_url else "straight_line_fallback",
             "warning": "Synthetic local demo; no real NGOs or delivery services are connected.",
         }
 
     @app.get("/api/metrics")
-    def metrics() -> dict[str, int]:
+    def metrics():
         return database.metrics()
 
     @app.get("/api/ngos")
-    def ngos() -> list[dict[str, Any]]:
+    def list_ngos():
         return database.list_ngos()
 
     @app.post("/api/donations", status_code=201)
@@ -111,23 +186,46 @@ def create_app(config: Settings = settings) -> FastAPI:
             result = workflow.process_new(donation["id"], message)
         except Exception as exc:
             current = database.get_donation(donation["id"])
-            database.update_donation(
-                donation["id"], current["status"], "ERROR", "WORKFLOW_ERROR", "system",
-                "Processing failed without overwriting the last persisted facts",
-                {"error_type": type(exc).__name__}, error_message=str(exc),
-            )
+            if current["status"] != "ERROR":
+                database.update_donation(
+                    donation["id"], current["status"], "ERROR", "WORKFLOW_ERROR", "system",
+                    "Processing failed without overwriting the last persisted facts",
+                    {"error_type": type(exc).__name__}, error_message=str(exc),
+                )
+            if isinstance(exc, (LLMError, AgentProtocolError)):
+                raise
             raise HTTPException(status_code=500, detail="Offer processing failed safely") from exc
+
         if scenario:
+            current_status = result["status"] if isinstance(result, dict) and "status" in result else donation["status"]
             database.audit(
-                donation["id"], "DEMO_SCENARIO_STARTED", result["status"], result["status"],
+                donation["id"], "DEMO_SCENARIO_STARTED", current_status, current_status,
                 {"scenario": scenario, "synthetic": True}, "demo_operator",
                 f"Synthetic '{scenario}' judge scenario launched",
             )
             result = database.get_donation(donation["id"])
+
         return result
 
-    @app.post("/api/demo/scenarios/{scenario}", status_code=201)
-    def run_demo_scenario(scenario: str, body: DemoScenarioRequest) -> dict[str, Any]:
+    @app.post("/api/donations/{donation_id}/retry")
+    def retry_donation(donation_id: str, body: ActionRequest | None = None):
+        """Authorised retry of a donation in ERROR status."""
+        actor = body.actor if body else "demo_coordinator"
+        _require_demo_actor(actor, "coordinator")
+        key = body.idempotency_key if body else None
+        cached = database.idempotent_response(donation_id, "retry", key)
+        if cached:
+            return cached
+        try:
+            result = workflow.retry_processing(donation_id)
+        except Exception as exc:
+            if isinstance(exc, (LLMError, AgentProtocolError)):
+                raise
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        database.save_idempotent_response(donation_id, "retry", key, result)
+        return result
+
+    def _execute_scenario(scenario_id: str, idempotency_key: str):
         now = datetime.now(config.timezone).replace(microsecond=0)
         prepared = (now - timedelta(minutes=20)).isoformat()
         deadline = (now + timedelta(hours=3)).isoformat()
@@ -136,7 +234,12 @@ def create_app(config: Settings = settings) -> FastAPI:
                 f"40 portions vegetarian biryani prepared at {prepared}, kept hot, "
                 f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
             ),
+            "complete_veg": (
+                f"40 portions vegetarian biryani prepared at {prepared}, kept hot, "
+                f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
+            ),
             "missing": "We have surplus meals left after a synthetic college event.",
+            "clarification": "We have surplus meals left after a synthetic college event.",
             "rejection": (
                 f"35 portions vegetarian rice prepared at {prepared}, refrigerated, "
                 f"pickup by {deadline} from Demo Hall Jaipur, coordinates 26.9050, 75.7750"
@@ -145,82 +248,99 @@ def create_app(config: Settings = settings) -> FastAPI:
                 f"24 portions vegetarian rice prepared at {prepared}, room temperature, "
                 f"pickup by {deadline} from Demo Hall Jaipur, coordinates 26.9050, 75.7750"
             ),
+            "blocked": (
+                f"24 portions vegetarian rice prepared at {prepared}, room temperature, "
+                f"pickup by {deadline} from Demo Hall Jaipur, coordinates 26.9050, 75.7750"
+            ),
             "escalation": (
                 f"30 portions vegetarian biryani prepared at {prepared}, kept hot, "
-                f"pickup by {deadline} from Demo Kitchen Jaipur, coordinates 26.9100, 75.7800"
+                f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
             ),
         }
-        if scenario not in scenarios:
+        if scenario_id not in scenarios:
             raise HTTPException(status_code=404, detail="Unknown demo scenario")
-        result = _create_and_process(scenarios[scenario], body.idempotency_key, scenario=scenario)
-        result["demo_scenario"] = scenario
+
+        result = _create_and_process(scenarios[scenario_id], idempotency_key, scenario=scenario_id)
+        result["demo_scenario"] = scenario_id
         result["demo_guidance"] = {
             "complete": "Approve the proposal, simulate acceptance, then record delivery separately.",
+            "complete_veg": "Approve the proposal, simulate acceptance, then record delivery separately.",
             "missing": "Supply the displayed missing facts; the workflow will resume from validation.",
+            "clarification": "Supply the displayed missing facts; the workflow will resume from validation.",
             "rejection": "Approve, simulate decline, inspect the replacement, then approve again.",
             "safety": "Inspect the deterministic review verdict; matching and dispatch remain blocked.",
+            "blocked": "Inspect the deterministic review verdict; matching and dispatch remain blocked.",
             "escalation": "Approve and simulate two timeouts or declines to reach bounded escalation.",
-        }[scenario]
+        }.get(scenario_id, "Demo scenario initiated.")
         return result
 
+    @app.post("/api/demo/scenario/{scenario_id}", status_code=201)
+    def run_scenario(scenario_id: str, body: DemoScenarioRequest):
+        return _execute_scenario(scenario_id, body.idempotency_key)
+
+    @app.post("/api/demo/scenarios/{scenario_id}", status_code=201)
+    def run_scenarios(scenario_id: str, body: DemoScenarioRequest):
+        return _execute_scenario(scenario_id, body.idempotency_key)
+
     @app.get("/api/donations")
-    def list_donations(
-        status: str | None = Query(default=None), search: str | None = Query(default=None, max_length=200)
-    ) -> list[dict[str, Any]]:
+    def list_donations(status: str | None = Query(default=None), search: str | None = Query(default=None)):
         return database.list_donations(status=status, search=search)
 
     @app.get("/api/donations/{donation_id}")
-    def get_donation(donation_id: str) -> dict[str, Any]:
+    def get_donation(donation_id: str):
         return database.get_donation(donation_id)
 
     @app.get("/api/donations/{donation_id}/audit")
-    def get_audit(donation_id: str) -> list[dict[str, Any]]:
+    def get_audit(donation_id: str):
         return database.get_donation(donation_id)["audit_events"]
 
     @app.get("/api/donations/{donation_id}/workflow")
-    def get_workflow(donation_id: str) -> dict[str, Any]:
+    def get_workflow(donation_id: str):
         return project_workflow(database.get_donation(donation_id))
 
     @app.get("/api/donations/{donation_id}/agent-executions")
-    def get_agent_executions(donation_id: str) -> list[dict[str, Any]]:
+    def get_agent_executions(donation_id: str):
         database.get_donation(donation_id)
         return database.list_agent_executions(donation_id)
 
     @app.post("/api/donations/{donation_id}/clarify")
-    def clarify(donation_id: str, body: ClarificationRequest) -> dict[str, Any]:
+    def clarify(donation_id: str, body: ClarificationRequest):
         cached = database.idempotent_response(donation_id, "clarify", body.idempotency_key)
         if cached:
             return cached
-        result = workflow.process_clarification(donation_id, body.fields)
+        try:
+            result = workflow.submit_clarification(donation_id, body.fields)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         database.save_idempotent_response(donation_id, "clarify", body.idempotency_key, result)
         return result
 
     @app.post("/api/donations/{donation_id}/approve")
-    def approve(donation_id: str, body: ActionRequest) -> dict[str, Any]:
+    def approve(donation_id: str, body: ActionRequest):
         _require_demo_actor(body.actor, "donor")
         return _idempotent_action(database, donation_id, "approve", body.idempotency_key,
                                   lambda: dispatch.approve(donation_id, body.actor, body.reason))
 
     @app.post("/api/donations/{donation_id}/reject")
-    def reject(donation_id: str, body: ActionRequest) -> dict[str, Any]:
+    def reject(donation_id: str, body: ActionRequest):
         _require_demo_actor(body.actor, "donor")
         return _idempotent_action(database, donation_id, "reject", body.idempotency_key,
                                   lambda: dispatch.reject_proposal(donation_id, body.actor, body.reason))
 
     @app.post("/api/donations/{donation_id}/ngo-response")
-    def ngo_response(donation_id: str, body: NGOResponseRequest) -> dict[str, Any]:
+    def ngo_response(donation_id: str, body: NGOResponseRequest):
         _require_demo_actor(body.actor, "ngo")
         return _idempotent_action(database, donation_id, f"ngo-{body.response}", body.idempotency_key,
                                   lambda: dispatch.respond(donation_id, body.response, body.actor, body.reason))
 
     @app.post("/api/donations/{donation_id}/delivery-confirmation")
-    def delivery_confirmation(donation_id: str, body: DeliveryConfirmationRequest) -> dict[str, Any]:
+    def delivery_confirmation(donation_id: str, body: DeliveryConfirmationRequest):
         _require_demo_actor(body.actor, "coordinator")
         return _idempotent_action(database, donation_id, "delivery", body.idempotency_key,
                                   lambda: dispatch.confirm_delivery(donation_id, body.actor, body.verification_note))
 
     @app.post("/api/donations/{donation_id}/escalate")
-    def escalate(donation_id: str, body: ActionRequest) -> dict[str, Any]:
+    def escalate(donation_id: str, body: ActionRequest):
         _require_demo_actor(body.actor, "coordinator")
         return _idempotent_action(database, donation_id, "escalate", body.idempotency_key,
                                   lambda: dispatch.escalate(donation_id, body.actor, body.reason))
@@ -275,4 +395,3 @@ def _idempotent_action(database: Database, donation_id: str, action: str, key: s
 
 
 app = create_app()
-

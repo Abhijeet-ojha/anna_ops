@@ -159,18 +159,17 @@ def test_database_capacity_constraint(test_settings: Settings):
 
 def test_llm_failure_stops_before_safety_and_matching(monkeypatch, test_settings: Settings):
     import urllib.error
+    from annaops.config import CANONICAL_MODEL
 
-    configured = Settings(**{**test_settings.__dict__, "llm_api_key": "test", "llm_model": "demo-model"})
+    configured = Settings(**{**test_settings.__dict__, "llm_api_key": "test", "llm_model": CANONICAL_MODEL, "testing_mode": False})
     monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError("offline")))
     app = create_app(configured)
     with TestClient(app) as configured_client:
         response = configured_client.post("/api/donations", json={"message": complete_message(configured)})
-        assert response.status_code == 201
+        assert response.status_code == 503
         body = response.json()
-        assert body["status"] == "NEEDS_CLARIFICATION"
-        assert body["parsed"]["extraction_source"] == "llm_error"
-        assert body["safety"] is None
-        assert body["match"] is None
+        assert body["category"] == "retryable_provider_error"
+        assert body["retryable"] is True
 
 
 def test_reported_clarification_scenario_persists_items_and_all_answers(test_settings: Settings):
@@ -271,7 +270,7 @@ def test_workflow_projection_reflects_real_replanning(client: TestClient, test_s
     assert stages["safety"]["status"] == "completed"
     assert stages["matching"]["status"] == "completed"
     assert stages["approval"]["status"] == "awaiting_human"
-    assert stages["intake"]["fallback"] is not None
+    assert stages["intake"]["fallback"] is None
     assert all(stage["duration_ms"] is None or stage["duration_ms"] >= 0 for stage in stages.values())
 
     client.post(f"/api/donations/{offer['id']}/approve", json={"actor": "demo_donor"})

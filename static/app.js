@@ -1,6 +1,6 @@
-const state = { donations: [], selectedId: null, createRequestKey: null, creating: false, scenarioKeys: {}, actionKeys: {} };
+﻿const state = { donations: [], selectedId: null, createRequestKey: null, creating: false, scenarioKeys: {}, actionKeys: {} };
 const $ = (selector) => document.querySelector(selector);
-const esc = (value) => String(value ?? "—").replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const pretty = (value) => String(value ?? "").replaceAll("_", " ").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 const fmt = (value) => value ? new Date(value).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : "—";
 
@@ -23,7 +23,7 @@ function toast(message) {
 
 async function loadHealth() {
   const health = await api("/api/health");
-  $("#llmMode").textContent = health.llm === "configured" ? `${health.llm_provider === "gemini" ? "Gemini" : "LLM"} · ${health.llm_model}` : "Labelled demo parser";
+  $("#llmMode").textContent = health.llm === "configured" ? `Gemini 3.6 Flash (Mandatory)` : "Not configured (Startup Failed)";
   $("#routingMode").textContent = health.routing === "configured_osrm" ? "Configured OSRM" : "Straight-line fallback";
 }
 
@@ -112,7 +112,7 @@ function renderDetail(d, workflow) {
     <div class="detail-status"><span class="status ${d.status}">${pretty(d.status)}</span><small>Updated ${fmt(d.updated_at)}</small></div>
     <div class="demo-banner">Synthetic demonstration record. No real receiver or delivery service is connected.</div>
     ${actions}${clarification}
-    <section class="detail-card agent-observatory"><div class="observatory-heading"><div><h3>Agent execution observatory</h3><p class="observatory-note">Validated decisions and real tool results, shown newest first. Expand any run for evidence.</p></div><span>${(d.agent_executions || []).length} runs</span></div>${executions || '<div class="empty compact">No agent executions were recorded for this legacy case.</div>'}</section>
+    <section class="detail-card agent-observatory"><div class="observatory-heading"><div><h3>Agent execution observatory</h3><p class="observatory-note">Validated Gemini 3.6 Flash decisions and real tool results, shown newest first. Expand any run for evidence.</p></div><span>${(d.agent_executions || []).length} runs</span></div>${executions || '<div class="empty compact">No agent executions were recorded for this case.</div>'}</section>
     <section class="detail-card"><h3>Actual agent progression</h3><div class="detail-workflow">${renderWorkflowDetail(workflow)}</div></section>
     <section class="detail-card"><h3>Original donor message</h3><p class="quote">“${esc(d.original_message)}”</p></section>
     <section class="detail-card"><h3>Structured offer</h3>
@@ -131,34 +131,86 @@ function renderDetail(d, workflow) {
     ${exclusions ? `<section class="detail-card"><h3>Receiver exclusions · actual rule output</h3>${exclusions}</section>` : ""}
     ${approvals ? `<section class="detail-card"><h3>Donor approval history</h3>${approvals}</section>` : ""}
     ${dispatches ? `<section class="detail-card"><h3>Simulated dispatch & response history</h3>${dispatches}<p>No real NGO communication occurred.</p></section>` : ""}
-    <section class="detail-card"><h3>Audit trail</h3><div class="timeline">${events}</div><a class="download" href="/api/donations/${d.id}/record.csv">Download synthetic CSV record ↓</a></section>`;
+    <section class="detail-card"><h3>Audit trail</h3><div class="timeline">${events}</div><a class="download" href="/api/donations/${d.id}/record.csv">Download synthetic CSV record ↗</a></section>`;
 }
 
 function renderAgentExecutions(executions) {
   return executions.slice().reverse().map((execution, index) => {
     const output = execution.structured_output || {};
     const mode = execution.execution_mode || "deterministic";
-    const modeLabel = mode === "llm" ? `LLM · ${execution.model || "configured model"}` : mode === "deterministic_fallback" ? "Deterministic fallback" : "Deterministic authoritative";
+    const isError = Boolean(execution.error) || mode === "failed";
+    const category = execution.error?.category || "";
+    const isRetryable = category === "retryable_provider_error";
+
+    let modeBadgeClass = "deterministic";
+    let modeLabel = "Deterministic Rule / Gate";
+    if (mode === "llm" && !isError) {
+      modeBadgeClass = "llm-success";
+      modeLabel = `Gemini 3.6 Flash · Succeeded`;
+    } else if (isRetryable) {
+      modeBadgeClass = "provider-retryable";
+      modeLabel = `Retryable Provider Failure`;
+    } else if (mode === "failed" || isError) {
+      modeBadgeClass = "llm-failed";
+      modeLabel = `LLM Execution Failed`;
+    } else if (mode === "test_mock") {
+      modeBadgeClass = "test-mock";
+      modeLabel = `Test Mock · ${execution.model || "gemini-3.6-flash"}`;
+    }
+
+    const providerModel = execution.provider ? `${execution.provider} · ${execution.model || "gemini-3.6-flash"}` : (execution.model || "Authoritative Backend");
+
     const toolRows = (execution.tools || []).map(tool => `<div class="tool-event">
       <div><span class="tool-index">${tool.sequence || "•"}</span><strong>${esc(tool.name)}</strong></div>
       <p>${esc(tool.purpose || "Validated backend tool")}</p>
       <details><summary>Validated arguments and result</summary><pre>${esc(JSON.stringify({arguments: tool.arguments || {}, result: tool.result || {}}, null, 2))}</pre></details>
     </div>`).join("");
+
     const evidenceList = (output.evidence || []).map(item => `<li>${esc(item)}</li>`).join("");
-    return `<details class="agent-execution ${mode}" ${index === 0 ? "open" : ""}>
+
+    const retryGuidance = category === "configuration_error"
+      ? "Verify that ANNAOPS_GEMINI_API_KEY is configured with access to gemini-3.6-flash."
+      : category === "retryable_provider_error"
+      ? "The provider is temporarily rate-limited or unreachable. Safe to retry when service recovers."
+      : category === "structured_output_validation_failure"
+      ? "The model output failed schema validation. Safe to retry."
+      : category === "agent_protocol_failure"
+      ? "Agent protocol violation: model proposed an invalid action or unknown tool. Safe to retry."
+      : category === "agent_execution_limit_failure"
+      ? "Maximum agent iterations reached without a terminal decision. Safe to retry."
+      : (execution.error ? "Execution failed safely without state corruption. Safe to retry." : "");
+
+    return `<details class="agent-execution ${modeBadgeClass}" ${index === 0 ? "open" : ""}>
       <summary class="agent-execution-summary">
         <span class="summary-chevron" aria-hidden="true">›</span>
         <span class="agent-identity"><strong>${pretty(execution.agent_type)}</strong><small>${pretty(execution.workflow_stage)} · ${fmt(execution.started_at)}</small></span>
         <span class="summary-transition"><small>Decision</small><strong>${pretty(execution.selected_action)}</strong></span>
         <span class="summary-arrow" aria-hidden="true">→</span>
         <span class="summary-transition"><small>State</small><strong>${pretty(execution.resulting_status)}</strong></span>
-        <span class="mode-badge ${mode}">${esc(modeLabel)}</span>
+        <span class="mode-badge ${modeBadgeClass}">${esc(modeLabel)}</span>
       </summary>
       <div class="agent-execution-body">
         <p class="agent-objective">${esc(execution.objective)}</p>
-        <div class="execution-meta"><span><small>Duration</small><strong>${duration(execution.duration_ms)}</strong></span><span><small>Extra model turns</small><strong>${execution.retry_count || 0}</strong></span><span><small>Tools used</small><strong>${(execution.tools || []).length}</strong></span></div>
+        <div class="execution-meta">
+          <span><small>Provider & Model</small><strong>${esc(providerModel)}</strong></span>
+          <span><small>Duration</small><strong>${duration(execution.duration_ms)}</strong></span>
+          <span><small>Extra model turns</small><strong>${execution.retry_count || 0}</strong></span>
+          <span><small>Tools used</small><strong>${(execution.tools || []).length}</strong></span>
+        </div>
+        ${execution.input_summary && Object.keys(execution.input_summary).length ? `
+          <div class="execution-section">
+            <h4>Relevant input summary</h4>
+            <pre class="input-summary-box">${esc(JSON.stringify(execution.input_summary, null, 2))}</pre>
+          </div>
+        ` : ""}
         ${evidenceList ? `<div class="execution-section"><h4>Decision evidence</h4><ul class="reason-list execution-evidence">${evidenceList}</ul></div>` : ""}
-        ${execution.error ? `<p class="execution-error"><strong>Fallback reason</strong><br>${esc(execution.error.type)} · ${esc(execution.error.message)}</p>` : ""}
+        ${execution.error ? `
+          <div class="execution-error-box">
+            <p class="execution-error"><strong>Failure Category:</strong> ${esc(execution.error.category || execution.error.type)}<br>
+            <strong>Diagnostic Message:</strong> ${esc(execution.error.message)}</p>
+            ${retryGuidance ? `<p class="retry-guidance"><strong>Safe Retry Guidance:</strong> ${esc(retryGuidance)}</p>` : ""}
+          </div>
+        ` : ""}
         ${toolRows ? `<div class="tool-sequence"><span class="section-label">Actual tool sequence</span>${toolRows}</div>` : '<p class="no-tools">No backend tool was needed for this decision.</p>'}
       </div>
     </details>`;
@@ -214,6 +266,7 @@ function renderActions(d) {
   if (d.status === "AWAITING_DONOR_APPROVAL") return `<div class="actions"><button class="action" data-action="approve">Approve proposed receiver</button><button class="action danger" data-action="reject">Reject proposal</button></div>`;
   if (d.status === "AWAITING_NGO_RESPONSE") return `<div class="actions"><button class="action wide" data-action="accept">Simulate NGO acceptance</button><button class="action danger" data-action="decline">Simulate decline</button><button class="action amber" data-action="timeout">Simulate timeout</button></div>`;
   if (d.status === "ACCEPTED") return `<div class="actions"><button class="action wide" data-action="delivery">Record separate demo delivery confirmation</button></div>`;
+  if (d.status === "ERROR") return `<div class="actions"><button class="action wide" data-action="retry">Retry workflow with Gemini 3.6 Flash</button><button class="action amber" data-action="escalate">Escalate to coordinator</button></div>`;
   if (["NEEDS_CLARIFICATION","REQUIRES_HUMAN_REVIEW","AWAITING_DONOR_APPROVAL","AWAITING_NGO_RESPONSE"].includes(d.status)) return `<div class="actions"><button class="action amber wide" data-action="escalate">Escalate to coordinator</button></div>`;
   return "";
 }
@@ -231,6 +284,7 @@ async function runAction(id, action, button) {
   if (["approve","reject"].includes(action)) { path = action; body = {actor: "demo_donor", idempotency_key: key}; }
   else if (["accept","decline","timeout"].includes(action)) { path = "ngo-response"; body = {actor: "demo_ngo", response: action, idempotency_key: key}; }
   else if (action === "delivery") { path = "delivery-confirmation"; body = {actor: "demo_coordinator", verification_note: "Delivery confirmation recorded by the hackathon demo operator.", idempotency_key: key}; }
+  else if (action === "retry") { path = "retry"; body = {actor: "demo_coordinator", reason: "Retrying after provider recovery", idempotency_key: key}; }
   else { path = "escalate"; body = {actor: "demo_coordinator", reason: "Manual coordinator review requested in demo.", idempotency_key: key}; }
   button.disabled = true;
   try {
@@ -259,14 +313,13 @@ async function submitClarification(event, id) {
 async function runScenario(scenario, button) {
   state.scenarioKeys[scenario] ||= crypto.randomUUID();
   const original = button.innerHTML; button.disabled = true;
-  button.insertAdjacentHTML("beforeend", '<small class="scenario-running">Running real workflow…</small>');
+  button.insertAdjacentHTML("beforeend", '<small class="scenario-running">Running Gemini 3.6 Flash workflow…</small>');
   try {
-    const result = await api(`/api/demo/scenarios/${scenario}`, {
+    const result = await api(`/api/demo/scenario/${scenario}`, {
       method: "POST", body: JSON.stringify({idempotency_key: state.scenarioKeys[scenario]})
     });
     delete state.scenarioKeys[scenario]; button.innerHTML = original; button.disabled = false; state.selectedId = result.id;
-    $("#demoGuidance").textContent = result.demo_guidance;
-    await refreshAll(); await openDetail(result.id); toast(`${pretty(scenario)} scenario created through the live agents.`);
+    await refreshAll(); await openDetail(result.id); toast(`${pretty(scenario)} scenario created.`);
   } catch (error) {
     button.innerHTML = original; button.disabled = false; toast(error.message);
   }
@@ -287,4 +340,3 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("keydown", event => { if (event.key === "Escape") closeDrawer(); });
   try { await Promise.all([loadHealth(), refreshAll()]); } catch (error) { toast(error.message); }
 });
-
