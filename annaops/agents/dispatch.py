@@ -20,7 +20,7 @@ class InvalidTransition(ValueError):
 class DispatchAgent:
     """Enforces approval, dispatch, retry, escalation, and delivery-confirmation gates.
 
-    Replanning requires Gemini 3.6 Flash via ReceiverAdvisorAgent. Failures do not
+    Replanning requires the configured LLM provider via ReceiverAdvisorAgent. Failures do not
     silently choose replacement receivers.
     """
 
@@ -84,13 +84,29 @@ class DispatchAgent:
         invalidated = self._invalidate_if_unsafe(donation)
         if invalidated:
             return invalidated
-        attempt = self.database.resolve_dispatch(donation_id, response, reason)
         if response == "accept":
+            attempt = self.database.pending_dispatch(donation_id)
+            offer = ExtractedOffer.model_validate(donation["parsed"])
+            items = [item.model_dump(mode="json") for item in offer.food_items]
+            if not items and offer.food_type and offer.quantity and offer.unit:
+                items = [{
+                    "name": offer.food_type, "quantity": offer.quantity,
+                    "unit": offer.unit, "category": offer.food_category,
+                }]
+            try:
+                reservation = self.database.reserve_ngo_demand(
+                    attempt["ngo_id"], items, donation_id
+                )
+            except ValueError as exc:
+                self.database.resolve_dispatch(donation_id, "decline", str(exc))
+                return self._replan_or_escalate(donation, "decline", actor, str(exc))
+            attempt = self.database.resolve_dispatch(donation_id, response, reason)
             result = self.database.update_donation(
                 donation_id, donation["status"], DonationStatus.ACCEPTED,
                 "NGO_ACCEPTED", actor,
                 reason or "Synthetic receiver accepted the simulated dispatch",
-                {"ngo_id": attempt["ngo_id"], "simulated": True, "delivery_confirmed": False},
+                {"ngo_id": attempt["ngo_id"], "simulated": True, "delivery_confirmed": False,
+                 "demand_reservation": reservation},
                 final_outcome_json={
                     "arrangement": "accepted", "delivery": "unconfirmed", "synthetic": True,
                     "note": "Acceptance confirms only the simulated arrangement."
@@ -103,6 +119,7 @@ class DispatchAgent:
                 ["read_dispatch_state", "persist_receiver_response"], started,
             )
             return result
+        attempt = self.database.resolve_dispatch(donation_id, response, reason)
         return self._replan_or_escalate(donation, response, actor, reason)
 
     def confirm_delivery(self, donation_id: str, actor: str, verification_note: str) -> dict[str, Any]:

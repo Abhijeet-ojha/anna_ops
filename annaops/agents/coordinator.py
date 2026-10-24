@@ -42,7 +42,7 @@ OPERATION_BY_STATUS = {
 
 
 class WorkflowCoordinatorAgent:
-    """Uses Gemini 3.6 Flash to propose next workflow operations within strict backend gates.
+    """Uses the configured LLM provider to propose next workflow operations within strict backend gates.
 
     The model inspects persisted state and proposes an action from a bounded set.
     Backend code validates that the proposed action is permitted for the current status.
@@ -52,7 +52,7 @@ class WorkflowCoordinatorAgent:
     def __init__(self, database: Database, config: Settings = settings, client: StructuredLLMClient | Any | None = None):
         self.database = database
         self.config = config
-        self.runtime = BoundedToolRuntime(config, client=client)
+        self.runtime = BoundedToolRuntime(config, client=client, database=database)
 
     def coordinate(self, donation_id: str) -> str:
         started_at = datetime.now(UTC).isoformat()
@@ -65,8 +65,8 @@ class WorkflowCoordinatorAgent:
 
         if not getattr(self.runtime.client, "configured", False):
             raise LLMConfigurationError(
-                "Workflow coordinator requires a configured Gemini LLM provider. "
-                f"Set ANNAOPS_GEMINI_API_KEY with canonical model '{CANONICAL_MODEL}'."
+                f"Workflow coordinator requires configured {self.config.llm_provider} access "
+                f"to model '{self.config.llm_model}'."
             )
 
         return self._coordinate_with_llm(donation, status, started, started_at)
@@ -98,6 +98,10 @@ class WorkflowCoordinatorAgent:
                 "read_persisted_workflow_state",
                 "Read the current persisted donation status, parsed/safety/match presence, and approval state.",
                 read_workflow_state,
+                bound_arguments={
+                    "donation_id": donation_id,
+                    "record_source": "Persisted donation workflow state",
+                },
             ),
         ]
 
@@ -117,6 +121,7 @@ class WorkflowCoordinatorAgent:
                 tools=tools,
                 allowed_actions=PERMITTED_OPERATIONS,
                 required_tools={"read_persisted_workflow_state"},
+                donation_id=donation_id,
             )
 
             proposed = outcome.decision.proposed_action

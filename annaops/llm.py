@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +15,10 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ValidationError
 
 from annaops.config import CANONICAL_MODEL, Settings, settings
+
+
+class LLMBudgetExceeded(RuntimeError):
+    category = "budget_exhausted"
 
 
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
@@ -49,32 +55,41 @@ class LLMInvocation:
     model: str
     duration_ms: int
     response_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 class StructuredLLMClient:
-    """Canonical Google Gemini OpenAI-compatible structured-output adapter.
+    """OpenAI-compatible structured-output adapter for the configured provider."""
 
-    Enforces gemini-3.6-flash, never stores credentials in results, validates every response
-    with Pydantic, and exposes only concise outputs rather than internal reasoning.
-    """
+    _semaphores: dict[int, threading.BoundedSemaphore] = {}
+    _semaphore_lock = threading.Lock()
 
-    def __init__(self, config: Settings = settings):
+    def __init__(self, config: Settings = settings, database: Any | None = None):
         self.config = config
+        self.database = database
+        with self._semaphore_lock:
+            self._semaphore = self._semaphores.setdefault(
+                config.llm_concurrency_limit,
+                threading.BoundedSemaphore(config.llm_concurrency_limit),
+            )
 
     @property
     def configured(self) -> bool:
         return bool(
             self.config.llm_api_key
             and self.config.llm_model
-            and self.config.llm_model == CANONICAL_MODEL
+            and self.config.llm_provider in {"gemini", "groq"}
         )
 
     @property
     def provider(self) -> str:
         netloc = urlparse(self.config.llm_base_url).netloc
+        if self.config.llm_provider:
+            return self.config.llm_provider
         if "generativelanguage.googleapis.com" in netloc:
             return "gemini"
-        return netloc or "gemini"
+        return netloc or "unknown"
 
     def complete_structured(
         self,
@@ -82,35 +97,42 @@ class StructuredLLMClient:
         *,
         system_prompt: str,
         user_payload: dict[str, Any] | str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = "none",
+        donation_id: str | None = None,
+        agent_type: str = "llm",
+        workflow_stage: str = "unknown",
     ) -> LLMInvocation:
         if not self.config.llm_api_key:
+            key_name = "GROQ_API_KEY" if self.config.llm_provider == "groq" else "ANNAOPS_GEMINI_API_KEY"
             raise LLMConfigurationError(
-                "ANNAOPS_GEMINI_API_KEY is not configured. "
-                "Set the environment variable with a valid key from Google AI Studio."
+                f"{key_name} is not configured for provider '{self.config.llm_provider}'."
             )
-        if not self.config.llm_model or self.config.llm_model != CANONICAL_MODEL:
+        if not self.config.llm_model:
             raise LLMConfigurationError(
-                f"Invalid model '{self.config.llm_model}'. "
-                f"AnnaOps requires canonical model '{CANONICAL_MODEL}'."
+                f"No model is configured for provider '{self.config.llm_provider}'."
             )
 
         schema = output_model.model_json_schema()
-        prompt = (
-            f"{system_prompt}\nReturn only one JSON object matching this JSON Schema. "
-            "Do not include markdown or hidden reasoning.\n"
-            f"Schema: {json.dumps(schema, separators=(',', ':'))}"
-        )
+        if tools:
+            prompt = (
+                f"{system_prompt}\nUse only the registered native tools supplied in this request. "
+                "Do not invent any unregistered tool. After tool results are provided, "
+                "return one object with all of these fields: current_task, observed_facts, "
+                "missing_or_ambiguous, proposed_action, action_arguments, tool_calls, evidence, "
+                "expected_outcome, human_input_required, and task_complete. "
+                "Use an empty array or object for fields with no values."
+            )
+        else:
+            prompt = (
+                f"{system_prompt}\nReturn only one JSON object matching this JSON Schema. "
+                "Do not include markdown or hidden reasoning.\n"
+                f"Schema: {json.dumps(schema, separators=(',', ':'))}"
+            )
         body = {
             "model": self.config.llm_model,
             "temperature": 0,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": output_model.__name__.lower(),
-                    "strict": True,
-                    "schema": schema,
-                },
-            },
+            "max_tokens": 1024,
             "messages": [
                 {"role": "system", "content": prompt},
                 {
@@ -119,60 +141,167 @@ class StructuredLLMClient:
                 },
             ],
         }
+        if self.config.llm_provider == "groq" and self.config.llm_model == "openai/gpt-oss-20b":
+            body["reasoning_effort"] = "low"
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice
+        else:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": output_model.__name__.lower(),
+                    # Groq accepts these application schemas in best-effort mode;
+                    # several contain intentionally open-ended dictionary fields.
+                    "strict": self.config.llm_provider != "groq",
+                    "schema": schema,
+                },
+            }
         request = urllib.request.Request(
             f"{self.config.llm_base_url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {self.config.llm_api_key}",
+                "Authorization": "Bearer " + self.config.llm_api_key,
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "annaops/1.0",
             },
             method="POST",
         )
-        started = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.llm_timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            content = payload["choices"][0]["message"]["content"]
-            output = output_model.model_validate_json(content)
-        except urllib.error.HTTPError as exc:
-            err_text = ""
+        max_attempts = self.config.llm_max_retries + 1
+        for attempt in range(1, max_attempts + 1):
+            started = time.perf_counter()
+            request_id = None
+            if donation_id and self.database:
+                request_id = self.database.reserve_llm_request(
+                    donation_id, agent_type, workflow_stage, self.config.llm_budget_per_donation,
+                    self.provider, self.config.llm_model,
+                )
             try:
-                err_text = exc.read().decode("utf-8")
-            except Exception:
-                pass
-            if exc.code == 401 or "API key" in err_text or "API_KEY" in err_text:
-                raise LLMConfigurationError(
-                    "Authentication failed. Verify that ANNAOPS_GEMINI_API_KEY is valid."
+                with self._semaphore:
+                    with urllib.request.urlopen(request, timeout=self.config.llm_timeout_seconds) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                message = payload["choices"][0]["message"]
+                native_tool_calls = message.get("tool_calls") or []
+                content = message.get("content")
+                if native_tool_calls and tools and output_model.__name__ == "AgentDecision":
+                    calls = []
+                    for call in native_tool_calls:
+                        function = call.get("function") or {}
+                        try:
+                            arguments = json.loads(function.get("arguments") or "{}")
+                        except json.JSONDecodeError as exc:
+                            raise LLMResponseError("Provider returned invalid tool arguments.") from exc
+                        calls.append({
+                            "name": function.get("name", ""),
+                            "arguments": arguments,
+                            "purpose": "Provider-selected registered tool",
+                        })
+                    output = output_model.model_validate({
+                        "current_task": "Execute the provider-selected registered tools",
+                        "observed_facts": [],
+                        "missing_or_ambiguous": [],
+                        "proposed_action": "use_tools",
+                        "action_arguments": {},
+                        "tool_calls": calls,
+                        "evidence": ["Provider returned a native tool call."],
+                        "expected_outcome": "Return validated tool results to the model.",
+                        "human_input_required": False,
+                        "task_complete": False,
+                    })
+                else:
+                    output = output_model.model_validate_json(content or "")
+                duration_ms = round((time.perf_counter() - started) * 1000)
+                usage = payload.get("usage") or {}
+                if request_id:
+                    self.database.complete_llm_request(
+                        request_id, outcome="succeeded", retry_count=attempt - 1,
+                        input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens"),
+                        latency_ms=duration_ms,
+                    )
+                return LLMInvocation(
+                    output=output,
+                    provider=self.provider,
+                    model=self.config.llm_model,
+                    duration_ms=duration_ms,
+                    response_id=payload.get("id"),
+                    input_tokens=usage.get("prompt_tokens"),
+                    output_tokens=usage.get("completion_tokens"),
+                )
+            except urllib.error.HTTPError as exc:
+                err_text = ""
+                try:
+                    err_text = exc.read().decode("utf-8")
+                except Exception:
+                    pass
+                if exc.code == 401 or "API key" in err_text or "API_KEY" in err_text:
+                    key_name = "GROQ_API_KEY" if self.config.llm_provider == "groq" else "ANNAOPS_GEMINI_API_KEY"
+                    raise LLMConfigurationError(f"Authentication failed. Verify that {key_name} is valid.") from exc
+                if exc.code == 403:
+                    access_hint = ""
+                    if "1010" in err_text or "model_permission" in err_text.lower():
+                        access_hint = (
+                            " Groq code 1010 indicates that organization or project model permissions "
+                            "may block this model; check the Groq Console model permissions."
+                        )
+                    raise LLMConfigurationError(
+                        f"Permission denied. The configured key does not have access to "
+                        f"'{self.config.llm_model}'.{access_hint}"
+                    ) from exc
+                if exc.code == 404 or "not found" in err_text.lower():
+                    raise LLMConfigurationError(
+                        f"Model '{self.config.llm_model}' was not found by the provider. "
+                        "Verify that the model identifier is correct and available to your account."
+                    ) from exc
+                retryable = exc.code in (408, 429, 500, 502, 503, 504)
+                if request_id:
+                    self.database.complete_llm_request(
+                        request_id, outcome="failed" if attempt == max_attempts or not retryable else "retrying",
+                        retry_count=attempt - 1, latency_ms=round((time.perf_counter() - started) * 1000),
+                        error_category="rate_limit" if exc.code == 429 else "provider_error",
+                    )
+                if retryable and attempt < max_attempts:
+                    retry_after = self._retry_after(exc)
+                    time.sleep(min(30.0, retry_after if retry_after is not None else (0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.25))))
+                    continue
+                if exc.code == 429:
+                    raise LLMRetryableError(
+                        f"Rate limit exceeded for '{self.config.llm_model}'. Safe to retry."
+                    ) from exc
+                if not retryable:
+                    raise LLMConfigurationError(
+                        f"Provider rejected the request with HTTP {exc.code}: {err_text[:200]}"
+                    ) from exc
+                raise LLMRetryableError(f"Provider returned HTTP {exc.code}: {err_text[:200]}") from exc
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                if request_id:
+                    self.database.complete_llm_request(
+                        request_id, outcome="failed" if attempt == max_attempts else "retrying",
+                        retry_count=attempt - 1, latency_ms=round((time.perf_counter() - started) * 1000),
+                        error_category="transport_error",
+                    )
+                if attempt < max_attempts:
+                    time.sleep(min(30.0, 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)))
+                    continue
+                raise LLMRetryableError(f"Provider was unreachable: {type(exc).__name__}") from exc
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValidationError) as exc:
+                if request_id:
+                    self.database.complete_llm_request(
+                        request_id, outcome="failed", retry_count=attempt - 1,
+                        latency_ms=round((time.perf_counter() - started) * 1000),
+                        error_category="structured_output_validation_failure",
+                    )
+                raise LLMResponseError(
+                    f"Provider returned an invalid structured response: {type(exc).__name__}: {str(exc)[:300]}"
                 ) from exc
-            if exc.code == 403:
-                raise LLMConfigurationError(
-                    f"Permission denied. The API key does not have access to '{self.config.llm_model}'."
-                ) from exc
-            if exc.code == 404 or "not found" in err_text.lower():
-                raise LLMConfigurationError(
-                    f"Model '{self.config.llm_model}' was not found by the provider. "
-                    "Verify that the model identifier is correct and available to your account."
-                ) from exc
-            if exc.code == 429:
-                raise LLMRetryableError(
-                    f"Rate limit exceeded for '{self.config.llm_model}'. Safe to retry."
-                ) from exc
-            raise LLMRetryableError(f"Provider returned HTTP {exc.code}: {err_text[:200]}") from exc
-        except (TimeoutError, OSError, urllib.error.URLError) as exc:
-            raise LLMRetryableError(f"Provider was unreachable: {type(exc).__name__}") from exc
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValidationError) as exc:
-            raise LLMResponseError(
-                f"Provider returned an invalid structured response: {type(exc).__name__}"
-            ) from exc
 
-        duration_ms = round((time.perf_counter() - started) * 1000)
-        return LLMInvocation(
-            output=output,
-            provider=self.provider,
-            model=self.config.llm_model,
-            duration_ms=duration_ms,
-            response_id=payload.get("id"),
-        )
+    @staticmethod
+    def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+        value = exc.headers.get("Retry-After") if exc.headers else None
+        try:
+            return max(0.0, float(value)) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
 
 class TestMockClient:
@@ -197,6 +326,8 @@ class TestMockClient:
         *,
         system_prompt: str,
         user_payload: dict[str, Any] | str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = "none",
     ) -> LLMInvocation:
         self.calls.append({
             "output_model": output_model,

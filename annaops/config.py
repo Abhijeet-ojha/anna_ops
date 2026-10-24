@@ -12,10 +12,12 @@ from zoneinfo import ZoneInfo
 
 CANONICAL_MODEL = "gemini-3.6-flash"
 CANONICAL_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
 class ConfigurationError(RuntimeError):
-    """Raised when mandatory Gemini configuration is missing or invalid."""
+    """Raised when the selected LLM provider configuration is invalid."""
     category = "configuration_error"
 
 
@@ -45,6 +47,11 @@ class Settings:
     matching_rule_version: str = "demo-match-v1"
     llm_timeout_seconds: int = 20
     agent_max_iterations: int = 3
+    llm_max_retries: int = 2
+    llm_concurrency_limit: int = 2
+    llm_budget_per_donation: int = 5
+    llm_budget_extension: int = 2
+    llm_provider: str = "gemini"
     testing_mode: bool = False
 
     @property
@@ -52,7 +59,7 @@ class Settings:
         return ZoneInfo(self.timezone_name)
 
     def validate(self) -> None:
-        """Validate mandatory Gemini configuration at startup.
+        """Validate the selected provider configuration at startup.
 
         Raises ConfigurationError with an actionable message when required
         configuration is missing or invalid. Does not make a network call.
@@ -60,44 +67,43 @@ class Settings:
         if self.testing_mode:
             return
         errors: list[str] = []
+        provider = self.llm_provider.lower()
+        if provider not in {"gemini", "groq"}:
+            errors.append(f"Unsupported LLM provider '{self.llm_provider}'. Choose 'gemini' or 'groq'.")
         if not self.llm_api_key or not self.llm_api_key.strip():
-            errors.append(
-                "ANNAOPS_GEMINI_API_KEY is required. "
-                "Create an API key at https://aistudio.google.com/apikey "
-                "and set the environment variable."
-            )
+            key_name = "GROQ_API_KEY" if provider == "groq" else "ANNAOPS_GEMINI_API_KEY"
+            errors.append(f"{key_name} is required for the configured {provider} provider.")
+        expected_model = GROQ_MODEL if provider == "groq" else CANONICAL_MODEL
         if not self.llm_model or not self.llm_model.strip():
-            errors.append(
-                f"ANNAOPS_GEMINI_MODEL must be set. "
-                f"The canonical model for this project is '{CANONICAL_MODEL}'."
-            )
-        elif self.llm_model.strip() != CANONICAL_MODEL:
-            errors.append(
-                f"ANNAOPS_GEMINI_MODEL is set to '{self.llm_model}' but this project requires "
-                f"'{CANONICAL_MODEL}'. Update the environment variable or remove it to use the canonical default."
-            )
+            errors.append(f"LLM model must be set for {provider}; expected default is '{expected_model}'.")
+        elif provider == "gemini" and self.llm_model.strip() != CANONICAL_MODEL:
+            errors.append(f"Gemini requires canonical model '{CANONICAL_MODEL}'.")
         if not self.llm_base_url or not self.llm_base_url.strip():
-            errors.append(
-                f"LLM base URL is empty. The canonical URL is '{CANONICAL_BASE_URL}'."
-            )
+            errors.append(f"LLM base URL is empty for {provider}.")
         else:
             parsed = urlparse(self.llm_base_url.strip())
             if not parsed.scheme or not parsed.netloc:
                 errors.append(
                     f"LLM base URL '{self.llm_base_url}' is not a valid URL. "
-                    f"The canonical URL is '{CANONICAL_BASE_URL}'."
+                    f"Configure a valid OpenAI-compatible URL for {provider}."
                 )
         if errors:
             raise ConfigurationError(
-                "AnnaOps startup failed due to missing or invalid Gemini configuration:\n"
+                f"AnnaOps startup failed due to missing or invalid {provider} configuration:\n"
                 + "\n".join(f"  - {error}" for error in errors)
             )
 
     @classmethod
     def from_env(cls) -> "Settings":
-        key = _clean_env("ANNAOPS_GEMINI_API_KEY")
-        model = _clean_env("ANNAOPS_GEMINI_MODEL", CANONICAL_MODEL)
-        base_url = _clean_env("ANNAOPS_GEMINI_BASE_URL", CANONICAL_BASE_URL).rstrip("/")
+        gemini_key = _clean_env("ANNAOPS_GEMINI_API_KEY")
+        groq_key = _clean_env("GROQ_API_KEY")
+        provider = "groq" if groq_key else ("gemini" if gemini_key else "gemini")
+        key_name = "GROQ_API_KEY" if provider == "groq" else "ANNAOPS_GEMINI_API_KEY"
+        model_name = "GROQ_MODEL" if provider == "groq" else "ANNAOPS_GEMINI_MODEL"
+        base_name = "GROQ_BASE_URL" if provider == "groq" else "ANNAOPS_GEMINI_BASE_URL"
+        key = _clean_env(key_name)
+        model = _clean_env(model_name, GROQ_MODEL if provider == "groq" else CANONICAL_MODEL)
+        base_url = _clean_env(base_name, GROQ_BASE_URL if provider == "groq" else CANONICAL_BASE_URL).rstrip("/")
         routing_url = _clean_env("ANNAOPS_ROUTING_BASE_URL").rstrip("/")
 
         return cls(
@@ -112,6 +118,11 @@ class Settings:
             escalation_window_minutes=max(1, int(_clean_env("ANNAOPS_ESCALATION_WINDOW_MINUTES", "30"))),
             llm_timeout_seconds=max(3, int(_clean_env("ANNAOPS_LLM_TIMEOUT_SECONDS", "20"))),
             agent_max_iterations=max(1, min(5, int(_clean_env("ANNAOPS_AGENT_MAX_ITERATIONS", "3")))),
+            llm_max_retries=max(0, min(3, int(_clean_env("ANNAOPS_LLM_MAX_RETRIES", "2")))),
+            llm_concurrency_limit=max(1, int(_clean_env("ANNAOPS_LLM_CONCURRENCY_LIMIT", "2"))),
+            llm_budget_per_donation=max(1, int(_clean_env("ANNAOPS_LLM_BUDGET_PER_DONATION", "5"))),
+            llm_budget_extension=max(1, int(_clean_env("ANNAOPS_LLM_BUDGET_EXTENSION", "2"))),
+            llm_provider=provider,
         )
 
     @classmethod

@@ -23,7 +23,9 @@ function toast(message) {
 
 async function loadHealth() {
   const health = await api("/api/health");
-  $("#llmMode").textContent = health.llm === "configured" ? `Gemini 3.6 Flash (Mandatory)` : "Not configured (Startup Failed)";
+  $("#llmMode").textContent = health.llm === "configured"
+    ? `${pretty(health.llm_provider)} · ${health.llm_model}`
+    : "Not configured (Startup Failed)";
   $("#routingMode").textContent = health.routing === "configured_osrm" ? "Configured OSRM" : "Straight-line fallback";
 }
 
@@ -34,6 +36,7 @@ async function loadMetrics() {
     ["BLOCKED_OR_REVIEW", "Blocked / review"], ["ELIGIBLE_AWAITING_APPROVAL", "Awaiting approval"],
     ["PENDING_NGO_RESPONSE", "NGO pending"], ["ACCEPTED_AWAITING_DELIVERY", "Awaiting delivery"],
     ["COMPLETED_DEMO_DELIVERIES", "Completed demo"], ["ESCALATED_CASES", "Escalated"],
+    ["GEMINI_REQUESTS", "Gemini requests"], ["GEMINI_RATE_LIMIT_ERRORS", "Rate-limit errors"],
   ];
   $("#metrics").innerHTML = groups.map(([key, label]) => `<div class="metric"><strong>${data[key] || 0}</strong><span>${label}</span></div>`).join("");
 }
@@ -97,6 +100,7 @@ function renderDetail(d, workflow) {
   const candidates = (match.candidates || []).slice(0, 5).map(c => `
     <div class="candidate"><div class="candidate-top"><strong>#${c.rank} ${esc(c.ngo_name)}</strong><small>${c.score} points</small></div>
     <p>${c.route.distance_km == null ? "Route unavailable" : `${c.route.distance_km} km`} · ${pretty(c.route.method)}</p>
+    <p class="route-note">${(c.matched_demands || []).map(d => `Demand: ${esc(d.item_name)} · ${esc(d.remaining_quantity)} ${esc(d.unit)} remaining · minimum ${esc(d.minimum_quantity)} ${esc(d.unit)}`).join("<br>") || "Demand details unavailable"}</p>
     <ul class="reason-list">${(c.reasons || []).map(reason => `<li>${esc(reason)}</li>`).join("")}</ul>
     <p class="route-note">${esc(c.route.note)}</p></div>`).join("");
   const exclusions = Object.entries(match.exclusions || {}).map(([ngo, reasons]) => `
@@ -108,11 +112,13 @@ function renderDetail(d, workflow) {
   const approvals = (d.approval_decisions || []).map(item => `<div class="history-row"><strong>${pretty(item.decision)}</strong><span>${esc(item.actor)} · ${fmt(item.created_at)}</span></div>`).join("");
   const dispatches = (d.dispatch_attempts || []).map(a => `<div class="history-row"><strong>Attempt ${a.attempt_number} · ${esc(a.ngo_id)}</strong><span>${pretty(a.status)} · ${fmt(a.responded_at || a.requested_at)}</span></div>`).join("");
   const executions = renderAgentExecutions(d.agent_executions || []);
+  const usage = d.llm_usage || {};
+  const usageCard = `<section class="detail-card"><div class="observatory-heading"><div><h3>LLM usage</h3><p class="observatory-note">Measured provider-request accounting; token values are shown only when the provider returned them.</p></div><span>${usage.request_count || 0}/${usage.budget || "—"} requests</span></div><div class="history-row"><strong>Budget remaining</strong><span>${usage.budget_remaining ?? "—"}</span></div><div class="history-row"><strong>Successful / failed</strong><span>${usage.successful_requests || 0} / ${usage.failed_requests || 0}</span></div><div class="history-row"><strong>Retries / rate limits</strong><span>${usage.retry_count || 0} / ${usage.rate_limit_errors || 0}</span></div><div class="history-row"><strong>Tokens</strong><span>${usage.token_metrics_available ? `${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out` : "Unavailable from provider"}</span></div></section>`;
   return `
     <div class="detail-status"><span class="status ${d.status}">${pretty(d.status)}</span><small>Updated ${fmt(d.updated_at)}</small></div>
     <div class="demo-banner">Synthetic demonstration record. No real receiver or delivery service is connected.</div>
-    ${actions}${clarification}
-    <section class="detail-card agent-observatory"><div class="observatory-heading"><div><h3>Agent execution observatory</h3><p class="observatory-note">Validated Gemini 3.6 Flash decisions and real tool results, shown newest first. Expand any run for evidence.</p></div><span>${(d.agent_executions || []).length} runs</span></div>${executions || '<div class="empty compact">No agent executions were recorded for this case.</div>'}</section>
+    ${actions}${clarification}${usageCard}
+    <section class="detail-card agent-observatory"><div class="observatory-heading"><div><h3>Agent execution observatory</h3><p class="observatory-note">Validated configured-provider decisions and real tool results, shown newest first. Historical runs retain their recorded provider/model.</p></div><span>${(d.agent_executions || []).length} runs</span></div>${executions || '<div class="empty compact">No agent executions were recorded for this case.</div>'}</section>
     <section class="detail-card"><h3>Actual agent progression</h3><div class="detail-workflow">${renderWorkflowDetail(workflow)}</div></section>
     <section class="detail-card"><h3>Original donor message</h3><p class="quote">“${esc(d.original_message)}”</p></section>
     <section class="detail-card"><h3>Structured offer</h3>
@@ -146,7 +152,7 @@ function renderAgentExecutions(executions) {
     let modeLabel = "Deterministic Rule / Gate";
     if (mode === "llm" && !isError) {
       modeBadgeClass = "llm-success";
-      modeLabel = `Gemini 3.6 Flash · Succeeded`;
+      modeLabel = `${execution.provider || "Configured LLM"} · Succeeded`;
     } else if (isRetryable) {
       modeBadgeClass = "provider-retryable";
       modeLabel = `Retryable Provider Failure`;
@@ -155,21 +161,23 @@ function renderAgentExecutions(executions) {
       modeLabel = `LLM Execution Failed`;
     } else if (mode === "test_mock") {
       modeBadgeClass = "test-mock";
-      modeLabel = `Test Mock · ${execution.model || "gemini-3.6-flash"}`;
+      modeLabel = `Test Mock · ${execution.model || "test model"}`;
     }
 
-    const providerModel = execution.provider ? `${execution.provider} · ${execution.model || "gemini-3.6-flash"}` : (execution.model || "Authoritative Backend");
+    const providerModel = execution.provider ? `${execution.provider} · ${execution.model || "recorded model unavailable"}` : (execution.model || "Authoritative Backend");
 
     const toolRows = (execution.tools || []).map(tool => `<div class="tool-event">
       <div><span class="tool-index">${tool.sequence || "•"}</span><strong>${esc(tool.name)}</strong></div>
       <p>${esc(tool.purpose || "Validated backend tool")}</p>
-      <details><summary>Validated arguments and result</summary><pre>${esc(JSON.stringify({arguments: tool.arguments || {}, result: tool.result || {}}, null, 2))}</pre></details>
+      <div class="tool-input-heading"><span>Inputs used</span><small>${tool.argument_source === "backend_bound" ? "Backend-bound · validated" : "LLM-supplied · validated"}</small></div>
+      ${renderToolArguments(tool.arguments)}
+      <details><summary>View validated result (JSON)</summary><pre>${esc(JSON.stringify(tool.result || {}, null, 2))}</pre></details>
     </div>`).join("");
 
     const evidenceList = (output.evidence || []).map(item => `<li>${esc(item)}</li>`).join("");
 
     const retryGuidance = category === "configuration_error"
-      ? "Verify that ANNAOPS_GEMINI_API_KEY is configured with access to gemini-3.6-flash."
+      ? `Verify that ${execution.provider === "groq" ? "GROQ_API_KEY" : "ANNAOPS_GEMINI_API_KEY"} is configured with access to ${execution.model || "the recorded model"}.`
       : category === "retryable_provider_error"
       ? "The provider is temporarily rate-limited or unreachable. Safe to retry when service recovers."
       : category === "structured_output_validation_failure"
@@ -217,6 +225,21 @@ function renderAgentExecutions(executions) {
   }).join("");
 }
 
+function renderToolArguments(argumentsValue) {
+  const entries = Object.entries(argumentsValue || {});
+  if (!entries.length) return '<p class="tool-empty-arguments">This tool requires no runtime inputs.</p>';
+  return `<dl class="tool-arguments">${entries.map(([key, value]) => `
+    <div><dt>${pretty(key)}</dt><dd>${esc(formatToolArgument(value))}</dd></div>`).join("")}</dl>`;
+}
+
+function formatToolArgument(value) {
+  if (value == null || value === "") return "Not supplied";
+  if (Array.isArray(value)) return value.length ? value.map(formatToolArgument).join(" · ") : "None";
+  if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${pretty(key)}: ${formatToolArgument(item)}`).join(" · ");
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value);
+}
+
 function fact(label, value) { return `<div class="fact"><span>${label}</span><strong>${esc(value || "Not supplied")}</strong></div>`; }
 function evidence(label, values) { const list = values || []; return `<div class="evidence-box"><span>${label}</span><p>${list.length ? list.map(esc).join(" · ") : "None"}</p></div>`; }
 
@@ -257,17 +280,28 @@ async function loadWorkflowSpotlight() {
 function renderClarification(d) {
   if (!["NEEDS_CLARIFICATION", "REQUIRES_HUMAN_REVIEW"].includes(d.status)) return "";
   const fields = d.parsed?.missing_fields || [];
-  if (!fields.length && d.status === "REQUIRES_HUMAN_REVIEW") return "";
-  const placeholders = {prepared_at: "e.g. 6 pm or 2026-10-23T18:00:00+05:30", pickup_deadline: "e.g. 8 pm or a full ISO timestamp", storage_conditions: "e.g. refrigerated, kept hot, cold", donor_location: "Pickup location"};
-  return `<section class="detail-card"><h3>Supply missing facts</h3><form id="clarifyForm" class="clarify-grid">${fields.map(field => `<label>${pretty(field)}<input name="${field}" placeholder="${esc(placeholders[field] || `Enter ${pretty(field).toLowerCase()}`)}" required></label>`).join("")}<p class="form-error" id="clarifyError" role="alert" hidden></p><button class="action" id="clarifySubmit" type="submit">Submit clarification</button></form></section>`;
+  if (!fields.length && d.status === "REQUIRES_HUMAN_REVIEW") {
+    return `<section class="detail-card"><h3>Safety review required</h3><p>${esc((d.safety?.reasons || ["The submitted storage method requires coordinator review."]).join(" "))}</p></section>`;
+  }
+  const placeholders = {prepared_at: "e.g. 6 pm or 2026-10-23T18:00:00+05:30", pickup_deadline: "e.g. 8 pm or a full ISO timestamp", donor_location: "Pickup location"};
+  const correctingStorage = fields.includes("storage_conditions") && d.safety?.verdict === "REQUIRES_HUMAN_REVIEW";
+  const title = correctingStorage ? "Replace unsupported storage information" : "Supply missing facts";
+  const explanation = correctingStorage
+    ? `<p>${esc((d.safety?.reasons || ["Choose the exact storage method that was used."]).join(" "))}</p>`
+    : "";
+  const fieldControl = field => field === "storage_conditions"
+    ? `<select name="storage_conditions" required><option value="" selected disabled>Select the actual storage method</option><option value="kept hot">Kept hot</option><option value="refrigerated">Refrigerated</option><option value="chilled">Chilled</option><option value="frozen">Frozen</option><option value="room temperature">Room temperature — requires human review</option></select>`
+    : `<input name="${field}" placeholder="${esc(placeholders[field] || `Enter ${pretty(field).toLowerCase()}`)}" required>`;
+  return `<section class="detail-card"><h3>${title}</h3>${explanation}<form id="clarifyForm" class="clarify-grid">${fields.map(field => `<label>${pretty(field)}${fieldControl(field)}</label>`).join("")}<p class="form-error" id="clarifyError" role="alert" hidden></p><button class="action" id="clarifySubmit" type="submit">Submit clarification</button></form></section>`;
 }
 
 function renderActions(d) {
+  if (d.status === "REQUIRES_HUMAN_REVIEW") return `<div class="actions"><button class="action amber wide" data-action="safety-clarification">Request storage clarification</button><button class="action danger" data-action="safety-reject">Reject unsafe offer</button><button class="action" data-action="safety-approve">Approve only after safety revalidation</button></div>`;
   if (d.status === "AWAITING_DONOR_APPROVAL") return `<div class="actions"><button class="action" data-action="approve">Approve proposed receiver</button><button class="action danger" data-action="reject">Reject proposal</button></div>`;
   if (d.status === "AWAITING_NGO_RESPONSE") return `<div class="actions"><button class="action wide" data-action="accept">Simulate NGO acceptance</button><button class="action danger" data-action="decline">Simulate decline</button><button class="action amber" data-action="timeout">Simulate timeout</button></div>`;
   if (d.status === "ACCEPTED") return `<div class="actions"><button class="action wide" data-action="delivery">Record separate demo delivery confirmation</button></div>`;
-  if (d.status === "ERROR") return `<div class="actions"><button class="action wide" data-action="retry">Retry workflow with Gemini 3.6 Flash</button><button class="action amber" data-action="escalate">Escalate to coordinator</button></div>`;
-  if (["NEEDS_CLARIFICATION","REQUIRES_HUMAN_REVIEW","AWAITING_DONOR_APPROVAL","AWAITING_NGO_RESPONSE"].includes(d.status)) return `<div class="actions"><button class="action amber wide" data-action="escalate">Escalate to coordinator</button></div>`;
+  if (d.status === "ERROR") return `<div class="actions"><button class="action wide" data-action="retry">Retry workflow with configured LLM</button><button class="action amber" data-action="escalate">Escalate to coordinator</button></div>`;
+  if (["NEEDS_CLARIFICATION","AWAITING_DONOR_APPROVAL","AWAITING_NGO_RESPONSE"].includes(d.status)) return `<div class="actions"><button class="action amber wide" data-action="escalate">Escalate to coordinator</button></div>`;
   return "";
 }
 
@@ -283,6 +317,15 @@ async function runAction(id, action, button) {
   const key = state.actionKeys[actionKey];
   if (["approve","reject"].includes(action)) { path = action; body = {actor: "demo_donor", idempotency_key: key}; }
   else if (["accept","decline","timeout"].includes(action)) { path = "ngo-response"; body = {actor: "demo_ngo", response: action, idempotency_key: key}; }
+  else if (["safety-approve","safety-clarification","safety-reject"].includes(action)) {
+    path = "safety-review";
+    body = {
+      actor: "demo_coordinator",
+      decision: action === "safety-approve" ? "approve" : action === "safety-reject" ? "reject" : "request_clarification",
+      reason: "Synthetic coordinator review recorded for the demo.",
+      idempotency_key: key,
+    };
+  }
   else if (action === "delivery") { path = "delivery-confirmation"; body = {actor: "demo_coordinator", verification_note: "Delivery confirmation recorded by the hackathon demo operator.", idempotency_key: key}; }
   else if (action === "retry") { path = "retry"; body = {actor: "demo_coordinator", reason: "Retrying after provider recovery", idempotency_key: key}; }
   else { path = "escalate"; body = {actor: "demo_coordinator", reason: "Manual coordinator review requested in demo.", idempotency_key: key}; }
@@ -313,7 +356,7 @@ async function submitClarification(event, id) {
 async function runScenario(scenario, button) {
   state.scenarioKeys[scenario] ||= crypto.randomUUID();
   const original = button.innerHTML; button.disabled = true;
-  button.insertAdjacentHTML("beforeend", '<small class="scenario-running">Running Gemini 3.6 Flash workflow…</small>');
+  button.insertAdjacentHTML("beforeend", '<small class="scenario-running">Running configured LLM workflow…</small>');
   try {
     const result = await api(`/api/demo/scenario/${scenario}`, {
       method: "POST", body: JSON.stringify({idempotency_key: state.scenarioKeys[scenario]})

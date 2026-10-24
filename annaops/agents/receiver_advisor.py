@@ -21,7 +21,7 @@ class ReceiverAdvice:
 
 
 class ReceiverAdvisorAgent:
-    """Uses Gemini 3.6 Flash to inspect live receiver tools while deterministic constraints remain authoritative.
+    """Uses the configured LLM provider to inspect live receiver tools while deterministic constraints remain authoritative.
 
     LLM failures are propagated explicitly; no silent fallback to the highest-ranked candidate.
     """
@@ -30,7 +30,7 @@ class ReceiverAdvisorAgent:
         self.database = database
         self.config = config
         self.matcher = MatchRouteAgent(config)
-        self.runtime = BoundedToolRuntime(config, client=client)
+        self.runtime = BoundedToolRuntime(config, client=client, database=database)
 
     def recommend(
         self,
@@ -52,6 +52,7 @@ class ReceiverAdvisorAgent:
                     "id": item["id"], "name": item["name"], "accepted_categories": item["accepted_categories"],
                     "available_capacity": item["available_capacity"], "minimum_quantity": item["minimum_quantity"],
                     "available": item["available"], "opens_at": item["opens_at"], "closes_at": item["closes_at"],
+                    "demands": item.get("demands", []),
                 }
                 for item in profiles
             ]
@@ -75,23 +76,67 @@ class ReceiverAdvisorAgent:
             latest_match = self.matcher.match(offer, profiles, excluded_ids)
             return latest_match.model_dump(mode="json")
 
+        offered_food = [
+            f"{item.quantity:g} {item.unit} of {item.name}"
+            for item in offer.food_items
+        ]
+        donation_id = donation.get("id")
+
         tools = [
-            ToolSpec("retrieve_receiver_profiles", "Read current receiver capacity, availability, categories, and hours.", retrieve_profiles),
-            ToolSpec("inspect_previous_attempts", "Read prior simulated dispatch attempts and responses for this donation.", inspect_attempts),
-            ToolSpec("run_eligibility_and_scoring", "Run authoritative eligibility, route estimation, exclusions, and scoring.", run_scoring),
+            ToolSpec(
+                "retrieve_receiver_profiles",
+                "Read current receiver capacity, availability, categories, and hours.",
+                retrieve_profiles,
+                bound_arguments={
+                    "donation_id": donation_id,
+                    "record_source": "Persisted synthetic receiver profiles and active demands",
+                    "fields_requested": ["availability", "capacity", "accepted categories", "opening hours", "active demands"],
+                },
+            ),
+            ToolSpec(
+                "inspect_previous_attempts",
+                "Read prior simulated dispatch attempts and responses for this donation.",
+                inspect_attempts,
+                bound_arguments={
+                    "donation_id": donation_id,
+                    "record_source": "Persisted dispatch history",
+                },
+            ),
+            ToolSpec(
+                "run_eligibility_and_scoring",
+                "Run authoritative eligibility, route estimation, exclusions, and scoring.",
+                run_scoring,
+                bound_arguments={
+                    "donation_id": donation_id,
+                    "offered_food": offered_food,
+                    "food_category": offer.food_category,
+                    "storage_conditions": offer.storage_conditions,
+                    "pickup_deadline": offer.pickup_deadline.isoformat() if offer.pickup_deadline else None,
+                    "donor_location": offer.donor_location,
+                    "donor_coordinates": (
+                        f"{offer.donor_latitude}, {offer.donor_longitude}"
+                        if offer.donor_latitude is not None and offer.donor_longitude is not None
+                        else None
+                    ),
+                    "excluded_receiver_ids": sorted(excluded_ids) or ["None"],
+                    "receiver_profile_source": "Current persisted receiver capacity and active demand",
+                },
+            ),
         ]
 
         if not getattr(self.runtime.client, "configured", False):
             raise LLMConfigurationError(
-                "Receiver advisor agent requires a configured Gemini LLM provider. "
-                f"Set ANNAOPS_GEMINI_API_KEY with canonical model '{CANONICAL_MODEL}'."
+                f"Receiver advisor agent requires configured {self.config.llm_provider} access "
+                f"to model '{self.config.llm_model}'."
             )
 
         outcome = self.runtime.run(
             agent_name="receiver advisor agent",
             objective=(
                 "Inspect live receiver evidence and recommend one eligible receiver, or escalate only when "
-                "the authoritative tool finds no eligible receiver. Previously attempted receivers cannot be reused."
+                "the authoritative tool finds no eligible receiver. Previously attempted receivers cannot be reused. "
+                "For recommend_receiver, action_arguments must contain selected_ngo_id set to one exact ngo_id "
+                "from the authoritative candidates. For escalate, action_arguments must contain a concise reason."
             ),
             context={
                 "donation_status": donation.get("status"),
@@ -102,6 +147,7 @@ class ReceiverAdvisorAgent:
             tools=tools,
             allowed_actions={"recommend_receiver", "escalate"},
             required_tools={"run_eligibility_and_scoring"},
+            donation_id=donation.get("id"),
         )
 
         if latest_match is None:

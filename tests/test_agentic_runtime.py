@@ -173,6 +173,13 @@ def test_receiver_agent_uses_tools_then_adapts_to_results(tmp_path: Path, test_s
     assert [event["name"] for event in advice.trace["tools"]] == [
         "retrieve_receiver_profiles", "run_eligibility_and_scoring"
     ]
+    profile_event, scoring_event = advice.trace["tools"]
+    assert profile_event["argument_source"] == "backend_bound"
+    assert profile_event["arguments"]["donation_id"] == donation["id"]
+    assert scoring_event["argument_source"] == "backend_bound"
+    assert scoring_event["arguments"]["offered_food"] == ["40 portions of vegetarian biryani"]
+    assert scoring_event["arguments"]["storage_conditions"] == "kept hot"
+    assert scoring_event["arguments"]["donor_location"] == "Demo Campus Jaipur"
     assert advice.selected_ngo_id == selected
     assert advice.trace["mode"] == "llm"
     assert client.calls[1]["user_payload"]["tool_results_so_far"]
@@ -242,9 +249,12 @@ def test_dashboard_explicitly_renders_llm_and_fallback_modes():
     assert "llm-success" in source
     assert "llm-failed" in source
     assert "Actual tool sequence" in source
+    assert "Inputs used" in source
+    assert "Backend-bound · validated" in source
 
 
 def test_gemini_environment_is_the_first_class_provider(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.setenv("ANNAOPS_GEMINI_API_KEY", "gemini-test-key")
     monkeypatch.delenv("ANNAOPS_GEMINI_MODEL", raising=False)
     monkeypatch.delenv("ANNAOPS_GEMINI_BASE_URL", raising=False)

@@ -56,6 +56,17 @@ def test_startup_fails_when_api_key_is_missing(tmp_path: Path):
         config.validate()
 
 
+def test_groq_key_takes_precedence_over_stale_gemini_key(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+    monkeypatch.setenv("ANNAOPS_GEMINI_API_KEY", "stale-gemini-key")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+    config = Settings.from_env()
+
+    assert config.llm_provider == "groq"
+    assert config.llm_api_key == "groq-test-key"
+
+
 def test_startup_fails_when_model_is_not_canonical(tmp_path: Path):
     """Silent substitution of another model like gemini-2.5-flash or gemini-3.8-flash is forbidden."""
     for invalid_model in ["gemini-2.5-flash", "gemini-3.8-flash", "gpt-4o", "claude-3-5-sonnet"]:
@@ -111,9 +122,99 @@ def test_canonical_model_is_used_in_provider_requests(monkeypatch, tmp_path: Pat
     res = client.complete_structured(ExtractedOffer, system_prompt="Test", user_payload="Test")
 
     assert captured["body"]["model"] == "gemini-3.6-flash"
+    assert "tool_choice" not in captured["body"]
+    assert "tools" not in captured["body"]
     assert captured["url"] == f"{CANONICAL_BASE_URL}/chat/completions"
+    assert captured["headers"]["Accept"] == "application/json"
+    assert captured["headers"]["User-agent"] == "annaops/1.0"
     assert res.model == "gemini-3.6-flash"
     assert res.provider == "gemini"
+
+
+def test_tool_enabled_groq_request_uses_auto_and_parses_native_call(monkeypatch, tmp_path: Path):
+    config = Settings.for_testing(
+        database_path=tmp_path / "test-tool-request.db",
+        llm_provider="groq",
+        llm_model="openai/gpt-oss-20b",
+        llm_base_url="https://api.groq.com/openai/v1",
+        testing_mode=False,
+    )
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return MockResponse({
+            "choices": [{"message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_persisted_workflow_state", "arguments": "{}"},
+                }],
+            }}],
+        })
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = StructuredLLMClient(config).complete_structured(
+        AgentDecision,
+        system_prompt="Use the registered tool.",
+        user_payload="Inspect state.",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "read_persisted_workflow_state",
+                "description": "Read persisted state.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        }],
+        tool_choice="auto",
+    )
+
+    assert captured["body"]["tool_choice"] == "auto"
+    assert captured["body"]["tools"][0]["function"]["name"] == "read_persisted_workflow_state"
+    assert "response_format" not in captured["body"]
+    assert result.output.proposed_action == "use_tools"
+    assert result.output.tool_calls[0].name == "read_persisted_workflow_state"
+
+
+def test_required_tool_set_still_uses_auto_with_backend_enforcement(monkeypatch, tmp_path: Path):
+    config = Settings.for_testing(
+        database_path=tmp_path / "test-required-tool.db",
+        llm_provider="groq",
+        llm_model="openai/gpt-oss-20b",
+        llm_base_url="https://api.groq.com/openai/v1",
+        testing_mode=False,
+    )
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return MockResponse({
+            "choices": [{"message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1", "type": "function",
+                    "function": {"name": "read_persisted_workflow_state", "arguments": "{}"},
+                }],
+            }}],
+        })
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    StructuredLLMClient(config).complete_structured(
+        AgentDecision,
+        system_prompt="Use the required tool.",
+        user_payload="Inspect state.",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "read_persisted_workflow_state",
+                "description": "Read persisted state.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        }],
+        tool_choice="auto",
+    )
+    assert captured["body"]["tool_choice"] == "auto"
 
 
 def test_provider_authentication_error_mapped(monkeypatch, tmp_path: Path):
@@ -132,6 +233,45 @@ def test_provider_authentication_error_mapped(monkeypatch, tmp_path: Path):
     client = StructuredLLMClient(config)
     with pytest.raises(LLMConfigurationError, match="Authentication failed"):
         client.complete_structured(ExtractedOffer, system_prompt="Test", user_payload="Test")
+
+
+def test_groq_model_permission_error_includes_code_1010_guidance(monkeypatch, tmp_path: Path):
+    config = Settings.for_testing(
+        database_path=tmp_path / "test-groq-permission.db",
+        llm_api_key="valid-key",
+        llm_provider="groq",
+        llm_model="openai/gpt-oss-20b",
+        llm_base_url="https://api.groq.com/openai/v1",
+        testing_mode=False,
+    )
+
+    def fake_urlopen(*args, **kwargs):
+        error = urllib.error.HTTPError("https://fake", 403, "Forbidden", {}, None)
+        error.read = lambda: b"error code: 1010"
+        raise error
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(LLMConfigurationError, match="code 1010"):
+        StructuredLLMClient(config).complete_structured(
+            ExtractedOffer, system_prompt="Test", user_payload="Test"
+        )
+
+
+def test_diagnostic_redacts_api_key(monkeypatch, capsys):
+    from scripts.diagnose_groq import _category, main
+
+    monkeypatch.setenv("GROQ_API_KEY", "secret-that-must-not-print")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    monkeypatch.setenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.delenv("ANNAOPS_GEMINI_API_KEY", raising=False)
+
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.HTTPError("https://fake", 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert main() == 1
+    assert "secret-that-must-not-print" not in capsys.readouterr().out
+    assert _category(403, "<html><title>Attention Required</title></html>") == "intermediary_security_block"
 
 
 def test_unsupported_model_error_mapped(monkeypatch, tmp_path: Path):

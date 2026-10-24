@@ -21,6 +21,7 @@ from annaops.schemas import ExtractedOffer, FoodItem
 
 
 CRITICAL_FIELDS = ("food_type", "quantity", "unit", "prepared_at", "pickup_deadline", "donor_location")
+SUPPORTED_STORAGE_CONDITIONS = ("kept hot", "refrigerated", "chilled", "frozen", "room temperature")
 QUESTION_BY_FIELD = {
     "food_type": "What food is available, and is it vegetarian, non-vegetarian, or mixed?",
     "quantity": "How much food is available?",
@@ -37,25 +38,26 @@ class IntakeError(RuntimeError):
 
 
 class IntakeAgent:
-    """Extracts structured donor facts using Gemini 3.6 Flash.
+    """Extracts structured donor facts using the configured LLM provider.
 
     Silent deterministic fallback is removed. All language extraction requires
     the configured LLM or an explicitly injected test client.
     """
 
-    def __init__(self, config: Settings = settings, client: StructuredLLMClient | Any | None = None):
+    def __init__(self, config: Settings = settings, client: StructuredLLMClient | Any | None = None, database: Any | None = None):
         self.config = config
+        self.database = database
         if client is None and getattr(config, "testing_mode", False):
             self.llm = TestMockClient(config)
         else:
-            self.llm = client or StructuredLLMClient(config)
+            self.llm = client or StructuredLLMClient(config, database=database)
 
-    def extract(self, message: str) -> ExtractedOffer:
-        result, _ = self.extract_with_trace(message)
+    def extract(self, message: str, donation_id: str | None = None) -> ExtractedOffer:
+        result, _ = self.extract_with_trace(message, donation_id=donation_id)
         return result
 
-    def extract_with_trace(self, message: str) -> tuple[ExtractedOffer, dict[str, Any]]:
-        """Extract offer facts using Gemini 3.6 Flash.
+    def extract_with_trace(self, message: str, donation_id: str | None = None) -> tuple[ExtractedOffer, dict[str, Any]]:
+        """Extract offer facts using the configured LLM provider.
 
         Raises LLMError subclasses on provider failure. Never silently falls
         back to a deterministic parser.
@@ -63,11 +65,11 @@ class IntakeAgent:
         started = time.perf_counter()
         if not getattr(self.llm, "configured", False):
             raise LLMConfigurationError(
-                "Intake agent requires a configured Gemini LLM provider. "
-                f"Set ANNAOPS_GEMINI_API_KEY with canonical model '{CANONICAL_MODEL}'."
+                f"Intake agent requires configured {self.config.llm_provider} access "
+                f"to model '{self.config.llm_model}'."
             )
 
-        result, invocation = self._extract_with_llm(message)
+        result, invocation = self._extract_with_llm(message, donation_id=donation_id)
         duration_ms = invocation.duration_ms if hasattr(invocation, "duration_ms") else round((time.perf_counter() - started) * 1000)
         provider = getattr(invocation, "provider", "gemini")
         model = getattr(invocation, "model", CANONICAL_MODEL)
@@ -84,7 +86,7 @@ class IntakeAgent:
             "selected_action": "request_clarification" if result.missing_fields or result.contradictions else "submit_for_safety",
         }
 
-    def _extract_with_llm(self, message: str) -> tuple[ExtractedOffer, LLMInvocation]:
+    def _extract_with_llm(self, message: str, donation_id: str | None = None) -> tuple[ExtractedOffer, LLMInvocation]:
         prompt = (
             "You are the AnnaOps Intake Agent. Extract only explicitly stated surplus-food donation facts. "
             "Never invent values. Preserve each quantity, unit, and food item as its own food_items entry. "
@@ -92,11 +94,13 @@ class IntakeAgent:
             "in inferred_fields, flag ambiguity in contradictions, ask only concise questions needed to resolve "
             "missing or ambiguous facts, and use ISO-8601 timestamps. Do not make a food-safety decision."
         )
-        invocation = self.llm.complete_structured(
-            ExtractedOffer,
-            system_prompt=prompt,
-            user_payload={"original_donor_message": message},
-        )
+        kwargs: dict[str, Any] = {
+            "system_prompt": prompt,
+            "user_payload": {"original_donor_message": message},
+        }
+        if donation_id and isinstance(self.llm, StructuredLLMClient):
+            kwargs.update(donation_id=donation_id, agent_type="intake_agent", workflow_stage="intake")
+        invocation = self.llm.complete_structured(ExtractedOffer, **kwargs)
         result = ExtractedOffer.model_validate(invocation.output)
         payload = result.model_dump()
         payload["extraction_source"] = "configured_llm"
@@ -126,6 +130,14 @@ class IntakeAgent:
             inferred: list[str] = []
             if key in {"prepared_at", "pickup_deadline"}:
                 value, inferred = self._normalize_datetime_answer(key, value, reference_at)
+            elif key == "storage_conditions":
+                value = str(value).strip().lower()
+                if value not in SUPPORTED_STORAGE_CONDITIONS:
+                    supported = ", ".join(SUPPORTED_STORAGE_CONDITIONS)
+                    raise ValueError(
+                        f"Unsupported storage condition '{value}'. Use one of: {supported}. "
+                        "Room temperature will still require human safety review."
+                    )
             elif isinstance(value, str):
                 value = value.strip()
             payload[key] = value

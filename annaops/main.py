@@ -16,7 +16,7 @@ from annaops.agents.dispatch import DispatchAgent, InvalidTransition
 from annaops.agents.matching import FICTIONAL_NGOS
 from annaops.agents.runtime import AgentExecutionLimitError, AgentProtocolError
 from annaops.config import CANONICAL_MODEL, ConfigurationError, Settings, settings
-from annaops.db import Database
+from annaops.db import BudgetExceeded, Database
 from annaops.llm import (
     LLMConfigurationError,
     LLMError,
@@ -32,6 +32,7 @@ from annaops.schemas import (
     DemoScenarioRequest,
     DonationCreate,
     NGOResponseRequest,
+    SafetyReviewRequest,
 )
 from annaops.workflow import DonationWorkflow
 from annaops.projections import project_workflow
@@ -48,7 +49,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        # Validate mandatory Gemini configuration at application startup
+        # Validate the configured LLM provider at application startup
         config.validate()
         database.initialize()
         database.seed_ngos(FICTIONAL_NGOS)
@@ -57,7 +58,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
     app = FastAPI(
         title="AnnaOps",
         version=__version__,
-        description="Surplus-food donation coordination powered by Gemini 3.6 Flash.",
+        description="Surplus-food donation coordination powered by the configured LLM provider.",
         lifespan=lifespan,
     )
     app.state.config = config
@@ -88,12 +89,15 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
 
     @app.exception_handler(LLMConfigurationError)
     async def llm_config_handler(_, exc: LLMConfigurationError):
+        provider = config.llm_provider
+        model = config.llm_model or "configured model"
+        key_name = "GROQ_API_KEY" if provider == "groq" else "ANNAOPS_GEMINI_API_KEY"
         return JSONResponse(status_code=503, content={
             "error": "configuration_error",
             "detail": str(exc),
             "category": exc.category,
             "retryable": False,
-            "guidance": "Verify that ANNAOPS_GEMINI_API_KEY is configured with access to gemini-3.6-flash.",
+            "guidance": f"Verify that {key_name} is configured with access to {model}.",
         })
 
     @app.exception_handler(LLMRetryableError)
@@ -140,6 +144,16 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
     async def runtime_handler(_, exc: RuntimeError):
         return JSONResponse(status_code=409, content={"error": "workflow_conflict", "detail": str(exc)})
 
+    @app.exception_handler(BudgetExceeded)
+    async def budget_handler(_, exc: BudgetExceeded):
+        return JSONResponse(status_code=409, content={
+            "error": "llm_budget_exhausted",
+            "detail": str(exc),
+            "category": exc.category,
+            "retryable": False,
+            "guidance": "Extend the audited donation budget or retry after coordinator intervention.",
+        })
+
     @app.get("/api/health")
     def health():
         try:
@@ -147,17 +161,26 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
             database_status = "ok"
         except Exception:
             database_status = "error"
-        llm_configured = bool(config.llm_api_key and config.llm_model == CANONICAL_MODEL)
+        llm_configured = bool(config.llm_api_key and config.llm_model and config.llm_provider)
         return {
             "status": "ok" if database_status == "ok" else "degraded",
             "version": __version__,
             "database": database_status,
             "demo_mode": config.demo_mode,
             "llm": "configured" if llm_configured else "not_configured",
-            "llm_provider": "gemini",
+            "llm_provider": config.llm_provider,
             "llm_model": config.llm_model,
-            "canonical_model": CANONICAL_MODEL,
+            "llm_base_url": config.llm_base_url,
+            "llm_api_key_present": bool(config.llm_api_key),
+            "llm_config_source": "GROQ_API_KEY/GROQ_MODEL/GROQ_BASE_URL" if config.llm_provider == "groq"
+            else "ANNAOPS_GEMINI_API_KEY/ANNAOPS_GEMINI_MODEL/ANNAOPS_GEMINI_BASE_URL",
+            "canonical_model": CANONICAL_MODEL if config.llm_provider == "gemini" else None,
             "agent_runtime": {"max_iterations": config.agent_max_iterations, "timeout_seconds": config.llm_timeout_seconds},
+            "llm_controls": {
+                "budget_per_donation": config.llm_budget_per_donation,
+                "max_retries": config.llm_max_retries,
+                "concurrency_limit": config.llm_concurrency_limit,
+            },
             "routing": "configured_osrm" if config.routing_base_url else "straight_line_fallback",
             "warning": "Synthetic local demo; no real NGOs or delivery services are connected.",
         }
@@ -192,7 +215,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
                     "Processing failed without overwriting the last persisted facts",
                     {"error_type": type(exc).__name__}, error_message=str(exc),
                 )
-            if isinstance(exc, (LLMError, AgentProtocolError)):
+            if isinstance(exc, (LLMError, AgentProtocolError, BudgetExceeded)):
                 raise
             raise HTTPException(status_code=500, detail="Offer processing failed safely") from exc
 
@@ -219,7 +242,7 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         try:
             result = workflow.retry_processing(donation_id)
         except Exception as exc:
-            if isinstance(exc, (LLMError, AgentProtocolError)):
+            if isinstance(exc, (LLMError, AgentProtocolError, BudgetExceeded)):
                 raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         database.save_idempotent_response(donation_id, "retry", key, result)
@@ -230,6 +253,10 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         prepared = (now - timedelta(minutes=20)).isoformat()
         deadline = (now + timedelta(hours=3)).isoformat()
         scenarios = {
+            "annaops_e2e_success": (
+                f"25 portions synthetic vegetarian biryani prepared at {prepared}, kept hot, "
+                f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
+            ),
             "complete": (
                 f"40 portions vegetarian biryani prepared at {prepared}, kept hot, "
                 f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
@@ -237,6 +264,18 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
             "complete_veg": (
                 f"40 portions vegetarian biryani prepared at {prepared}, kept hot, "
                 f"pickup by {deadline} from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
+            ),
+            "demand_pasta": (
+                f"30 kg pasta prepared at {prepared}, kept hot, pickup by {deadline} "
+                f"from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
+            ),
+            "demand_incompatible": (
+                f"10 kg sushi prepared at {prepared}, kept hot, pickup by {deadline} "
+                f"from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
+            ),
+            "demand_quantity_mismatch": (
+                f"10 kg pasta prepared at {prepared}, kept hot, pickup by {deadline} "
+                f"from Demo Campus Jaipur, coordinates 26.9124, 75.7873"
             ),
             "missing": "We have surplus meals left after a synthetic college event.",
             "clarification": "We have surplus meals left after a synthetic college event.",
@@ -263,8 +302,12 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         result = _create_and_process(scenarios[scenario_id], idempotency_key, scenario=scenario_id)
         result["demo_scenario"] = scenario_id
         result["demo_guidance"] = {
+            "annaops_e2e_success": "Use the E2E runner to approve, accept, confirm delivery, and verify persistence.",
             "complete": "Approve the proposal, simulate acceptance, then record delivery separately.",
             "complete_veg": "Approve the proposal, simulate acceptance, then record delivery separately.",
+            "demand_pasta": "A persisted synthetic pasta demand should produce an explainable receiver proposal.",
+            "demand_incompatible": "No synthetic demand accepts this item; the workflow must remain without a receiver.",
+            "demand_quantity_mismatch": "The quantity is below the configured demand minimum; inspect exclusions.",
             "missing": "Supply the displayed missing facts; the workflow will resume from validation.",
             "clarification": "Supply the displayed missing facts; the workflow will resume from validation.",
             "rejection": "Approve, simulate decline, inspect the replacement, then approve again.",
@@ -303,6 +346,16 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         database.get_donation(donation_id)
         return database.list_agent_executions(donation_id)
 
+    @app.post("/api/donations/{donation_id}/llm-budget-extension")
+    def extend_llm_budget(donation_id: str, body: ActionRequest):
+        _require_demo_actor(body.actor, "coordinator")
+        donation = database.get_donation(donation_id)
+        extension = database.extend_llm_budget(
+            donation_id, body.actor, body.reason or "Coordinator approved recovery budget",
+            config.llm_budget_extension,
+        )
+        return {**donation, "llm_budget_extension": extension}
+
     @app.post("/api/donations/{donation_id}/clarify")
     def clarify(donation_id: str, body: ClarificationRequest):
         cached = database.idempotent_response(donation_id, "clarify", body.idempotency_key)
@@ -313,6 +366,19 @@ def create_app(config: Settings = settings, llm_client: StructuredLLMClient | An
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         database.save_idempotent_response(donation_id, "clarify", body.idempotency_key, result)
+        return result
+
+    @app.post("/api/donations/{donation_id}/safety-review")
+    def safety_review(donation_id: str, body: SafetyReviewRequest):
+        _require_demo_actor(body.actor, "coordinator")
+        cached = database.idempotent_response(donation_id, "safety-review", body.idempotency_key)
+        if cached:
+            return cached
+        try:
+            result = workflow.review_safety(donation_id, body.decision, body.actor, body.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        database.save_idempotent_response(donation_id, "safety-review", body.idempotency_key, result)
         return result
 
     @app.post("/api/donations/{donation_id}/approve")

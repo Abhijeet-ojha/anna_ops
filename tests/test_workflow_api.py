@@ -116,6 +116,73 @@ def test_incomplete_offer_can_be_clarified(client: TestClient, test_settings: Se
     assert clarified.json()["status"] == "AWAITING_DONOR_APPROVAL"
 
 
+def test_unknown_storage_requires_review_and_cannot_be_approved(client: TestClient, test_settings: Settings):
+    unknown = client.post(
+        "/api/donations",
+        json={"message": complete_message(test_settings, storage="room temperature")},
+    )
+    assert unknown.status_code == 201
+    body = unknown.json()
+    assert body["status"] == "REQUIRES_HUMAN_REVIEW"
+    assert "requires qualified human review" in body["safety"]["reasons"][0]
+    approval = client.post(
+        f"/api/donations/{body['id']}/safety-review",
+        json={"actor": "demo_coordinator", "decision": "approve", "reason": "Review attempted without new evidence"},
+    )
+    assert approval.status_code == 422
+    assert "revalidation remains" in approval.json()["detail"]
+    rejected = client.post(
+        f"/api/donations/{body['id']}/safety-review",
+        json={
+            "actor": "demo_coordinator",
+            "decision": "reject",
+            "reason": "Storage method could not be verified",
+            "idempotency_key": "review-reject-1",
+        },
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "BLOCKED"
+    assert rejected.json()["audit_events"][-1]["event_type"] == "SAFETY_REVIEW_REJECTED"
+
+
+def test_safety_review_can_request_clarification_then_revalidate(client: TestClient, test_settings: Settings):
+    response = client.post(
+        "/api/donations",
+        json={"message": complete_message(test_settings, storage="room temperature")},
+    )
+    donation = response.json()
+    requested = client.post(
+        f"/api/donations/{donation['id']}/safety-review",
+        json={
+            "actor": "demo_coordinator",
+            "decision": "request_clarification",
+            "reason": "Please provide the recognized storage method used for this offer",
+        },
+    )
+    assert requested.status_code == 200
+    requested_body = requested.json()
+    assert requested_body["status"] == "NEEDS_CLARIFICATION"
+    assert "storage_conditions" in requested_body["parsed"]["missing_fields"]
+    assert requested_body["parsed"]["storage_conditions"] is None
+    calls_before_clarification = len(client.app.state.workflow.intake_agent.llm.calls)
+    invalid = client.post(
+        f"/api/donations/{donation['id']}/clarify",
+        json={"fields": {"storage_conditions": "normal"}},
+    )
+    assert invalid.status_code == 422
+    assert "Unsupported storage condition" in invalid.json()["detail"]
+    unchanged = client.get(f"/api/donations/{donation['id']}").json()
+    assert unchanged["status"] == "NEEDS_CLARIFICATION"
+    assert unchanged["parsed"]["storage_conditions"] is None
+    clarified = client.post(
+        f"/api/donations/{donation['id']}/clarify",
+        json={"fields": {"storage_conditions": "refrigerated"}},
+    )
+    assert clarified.status_code == 200
+    assert clarified.json()["status"] == "AWAITING_DONOR_APPROVAL"
+    assert len(client.app.state.workflow.intake_agent.llm.calls) - calls_before_clarification == 2
+
+
 def test_audit_csv_health_and_role_gate(client: TestClient, test_settings: Settings):
     offer = create_offer(client, test_settings)
     audit = client.get(f"/api/donations/{offer['id']}/audit")
@@ -172,6 +239,31 @@ def test_llm_failure_stops_before_safety_and_matching(monkeypatch, test_settings
         assert body["retryable"] is True
 
 
+def test_groq_configuration_error_guidance_is_provider_specific(monkeypatch, test_settings: Settings):
+    import urllib.error
+
+    configured = Settings(**{
+        **test_settings.__dict__,
+        "llm_api_key": "test",
+        "llm_provider": "groq",
+        "llm_model": "openai/gpt-oss-20b",
+        "llm_base_url": "https://api.groq.com/openai/v1",
+        "testing_mode": False,
+    })
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            urllib.error.HTTPError("https://api.groq.com", 403, "Forbidden", {}, None)
+        ),
+    )
+    app = create_app(configured)
+    with TestClient(app) as configured_client:
+        response = configured_client.post("/api/donations", json={"message": complete_message(configured)})
+        assert response.status_code == 503
+        assert "GROQ_API_KEY" in response.json()["guidance"]
+        assert "openai/gpt-oss-20b" in response.json()["guidance"]
+
+
 def test_reported_clarification_scenario_persists_items_and_all_answers(test_settings: Settings):
     app = create_app(test_settings)
     with TestClient(app) as first_client:
@@ -192,7 +284,7 @@ def test_reported_clarification_scenario_persists_items_and_all_answers(test_set
                 "prepared_at": "6 pm",
                 "pickup_deadline": "8 pm",
                 "donor_location": "bengaluru",
-                "storage_conditions": "cold",
+                "storage_conditions": "refrigerated",
             },
             "idempotency_key": "reported-clarification",
         }
@@ -204,7 +296,7 @@ def test_reported_clarification_scenario_persists_items_and_all_answers(test_set
         assert parsed["pickup_deadline"].endswith("+05:30")
         assert parsed["prepared_at"].split("T")[0] == parsed["pickup_deadline"].split("T")[0]
         assert parsed["donor_location"] == "bengaluru"
-        assert parsed["storage_conditions"] == "cold"
+        assert parsed["storage_conditions"] == "refrigerated"
         assert clarified["original_message"] == "65 kgs of chicken biryani and 15 litres of raita"
         assert parsed["food_items"] == created["parsed"]["food_items"]
         assert clarified["selected_ngo_id"] is None
@@ -230,7 +322,7 @@ def test_reported_clarification_scenario_persists_items_and_all_answers(test_set
         assert restored.status_code == 200
         parsed = restored.json()["parsed"]
         assert parsed["donor_location"] == "bengaluru"
-        assert parsed["storage_conditions"] == "cold"
+        assert parsed["storage_conditions"] == "refrigerated"
         assert parsed["food_items"][0]["quantity"] == 65
         assert parsed["food_items"][1]["quantity"] == 15
 
@@ -345,4 +437,3 @@ def test_creation_key_conflict_rejected_but_same_message_with_new_key_allowed(cl
     assert second.status_code == 201
     assert first.json()["id"] != second.json()["id"]
     assert len(client.get("/api/donations").json()) == 2
-

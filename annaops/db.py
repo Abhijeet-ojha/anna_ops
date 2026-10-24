@@ -13,12 +13,17 @@ from typing import Any, Iterator
 from annaops.config import Settings, settings
 
 
+class BudgetExceeded(RuntimeError):
+    category = "budget_exhausted"
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 class Database:
     def __init__(self, config: Settings = settings):
+        self.config = config
         self.path = Path(config.database_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -80,11 +85,50 @@ class Database:
             minimum_quantity REAL NOT NULL DEFAULT 0,
             synthetic INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS ngo_demands (
+            id TEXT PRIMARY KEY,
+            ngo_id TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            requested_quantity REAL NOT NULL CHECK(requested_quantity > 0),
+            remaining_quantity REAL NOT NULL CHECK(remaining_quantity >= 0),
+            unit TEXT NOT NULL,
+            minimum_quantity REAL NOT NULL CHECK(minimum_quantity > 0),
+            priority INTEGER NOT NULL DEFAULT 0,
+            request_deadline TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            response_policy TEXT NOT NULL DEFAULT 'accept_if_eligible',
+            synthetic INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(ngo_id) REFERENCES ngo_profiles(id),
+            CHECK(remaining_quantity <= requested_quantity)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ngo_demands_ngo ON ngo_demands(ngo_id, active);
         CREATE TABLE IF NOT EXISTS safety_assessments (
             id TEXT PRIMARY KEY, donation_id TEXT NOT NULL, verdict TEXT NOT NULL,
             rule_version TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL,
             FOREIGN KEY(donation_id) REFERENCES donations(id)
         );
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            id TEXT PRIMARY KEY,
+            donation_id TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            workflow_stage TEXT NOT NULL,
+            provider TEXT,
+            model TEXT,
+            outcome TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(donation_id) REFERENCES donations(id)
+        );
+        CREATE TABLE IF NOT EXISTS llm_budget_extensions (
+            donation_id TEXT PRIMARY KEY,
+            extension INTEGER NOT NULL CHECK(extension > 0),
+            FOREIGN KEY(donation_id) REFERENCES donations(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_usage_donation ON llm_usage(donation_id, created_at);
         CREATE TABLE IF NOT EXISTS match_runs (
             id TEXT PRIMARY KEY, donation_id TEXT NOT NULL, rule_version TEXT NOT NULL,
             details_json TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -298,6 +342,97 @@ class Database:
             )
         return self.list_agent_executions(donation_id)[-1]
 
+    def reserve_llm_request(
+        self, donation_id: str, agent_type: str, workflow_stage: str, budget: int,
+        provider: str | None, model: str | None
+    ) -> str:
+        request_id = str(uuid.uuid4())
+        with self.transaction() as connection:
+            used = connection.execute(
+                "SELECT COUNT(*) AS count FROM llm_usage WHERE donation_id = ?",
+                (donation_id,),
+            ).fetchone()["count"]
+            extension_row = connection.execute(
+                "SELECT COALESCE(extension, 0) AS extension FROM llm_budget_extensions WHERE donation_id = ?",
+                (donation_id,),
+            ).fetchone()
+            extension = extension_row["extension"] if extension_row else 0
+            if used >= budget + extension:
+                provider_label = {"groq": "Groq", "gemini": "Gemini"}.get(
+                    provider or "", provider or "Configured LLM"
+                )
+                raise BudgetExceeded(
+                    f"{provider_label} request budget exhausted for donation {donation_id}: "
+                    f"{used}/{budget} requests used"
+                )
+            connection.execute(
+                """INSERT INTO llm_usage
+                (id, donation_id, agent_type, workflow_stage, provider, model, outcome, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'started', ?)""",
+                (request_id, donation_id, agent_type, workflow_stage, provider, model, utc_now()),
+            )
+        return request_id
+
+    def complete_llm_request(
+        self, request_id: str, *, outcome: str, retry_count: int = 0,
+        input_tokens: int | None = None, output_tokens: int | None = None,
+        latency_ms: int = 0, error_category: str | None = None
+    ) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE llm_usage SET outcome = ?, retry_count = ?, input_tokens = ?,
+                output_tokens = ?, latency_ms = ?, error_category = ? WHERE id = ?""",
+                (outcome, retry_count, input_tokens, output_tokens, max(0, latency_ms),
+                 error_category, request_id),
+            )
+
+    def extend_llm_budget(self, donation_id: str, actor: str, reason: str, extension: int) -> dict[str, int]:
+        if extension < 1:
+            raise ValueError("Budget extension must be positive")
+        with self.transaction() as connection:
+            self._audit(
+                connection, donation_id, "LLM_BUDGET_EXTENDED", None, None,
+                {"extension": extension}, actor, reason,
+            )
+            connection.execute(
+                """INSERT INTO llm_budget_extensions (donation_id, extension) VALUES (?, ?)
+                ON CONFLICT(donation_id) DO UPDATE SET extension = extension + excluded.extension""",
+                (donation_id, extension),
+            )
+            used = connection.execute(
+                "SELECT COUNT(*) AS count FROM llm_usage WHERE donation_id = ?", (donation_id,)
+            ).fetchone()["count"]
+        return {"used": used, "extension": extension}
+
+    def llm_usage(self, donation_id: str, budget: int = 0) -> dict[str, Any]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM llm_usage WHERE donation_id = ? ORDER BY created_at, rowid",
+                (donation_id,),
+            ).fetchall()
+            items = [dict(row) for row in rows]
+        with self.connection() as connection:
+            extension_row = connection.execute(
+                "SELECT COALESCE(extension, 0) AS extension FROM llm_budget_extensions WHERE donation_id = ?",
+                (donation_id,),
+            ).fetchone()
+            extension = extension_row["extension"] if extension_row else 0
+        return {
+            "request_count": len(items),
+            "budget": budget + extension,
+            "budget_remaining": max(0, budget + extension - len(items)),
+            "successful_requests": sum(item["outcome"] == "succeeded" for item in items),
+            "failed_requests": sum(item["outcome"] == "failed" for item in items),
+            "rate_limit_errors": sum(item["error_category"] == "rate_limit" for item in items),
+            "retry_count": sum(item["outcome"] == "retrying" for item in items),
+            "input_tokens": sum(item["input_tokens"] or 0 for item in items),
+            "output_tokens": sum(item["output_tokens"] or 0 for item in items),
+            "token_metrics_available": any(
+                item["input_tokens"] is not None or item["output_tokens"] is not None for item in items
+            ),
+            "requests": items,
+        }
+
     def list_agent_executions(self, donation_id: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
@@ -351,6 +486,16 @@ class Database:
             result.update(status=response.upper(), responded_at=utc_now(), response_reason=reason)
             return result
 
+    def pending_dispatch(self, donation_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM dispatch_attempts WHERE donation_id = ? AND status = 'AWAITING_RESPONSE' "
+                "ORDER BY attempt_number DESC LIMIT 1", (donation_id,)
+            ).fetchone()
+            if not row:
+                raise RuntimeError("No dispatch is awaiting a response")
+            return dict(row)
+
     def audit(self, donation_id: str, event_type: str, previous_status: str | None, resulting_status: str | None,
               details: dict[str, Any], actor: str, reason: str | None) -> None:
         with self.transaction() as connection:
@@ -395,13 +540,32 @@ class Database:
                     ON CONFLICT(id) DO UPDATE SET name=excluded.name, service_area=excluded.service_area,
                     latitude=excluded.latitude, longitude=excluded.longitude,
                     accepted_categories_json=excluded.accepted_categories_json,
-                    max_capacity=excluded.max_capacity, available_capacity=excluded.available_capacity,
+                    max_capacity=excluded.max_capacity,
                     opens_at=excluded.opens_at, closes_at=excluded.closes_at,
                     available=excluded.available, minimum_quantity=excluded.minimum_quantity""",
                     (profile["id"], profile["name"], profile["service_area"], profile["latitude"], profile["longitude"],
                      json.dumps(profile["accepted_categories"]), profile["max_capacity"], profile["available_capacity"],
                      profile["opens_at"], profile["closes_at"], int(profile["available"]), profile["minimum_quantity"]),
                 )
+                for demand in profile.get("demands", []):
+                    connection.execute(
+                        """INSERT INTO ngo_demands
+                        (id, ngo_id, item_name, requested_quantity, remaining_quantity, unit,
+                         minimum_quantity, priority, request_deadline, active, response_policy, synthetic)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        ON CONFLICT(id) DO UPDATE SET ngo_id=excluded.ngo_id,
+                        item_name=excluded.item_name, requested_quantity=excluded.requested_quantity,
+                        unit=excluded.unit, minimum_quantity=excluded.minimum_quantity,
+                        priority=excluded.priority, request_deadline=excluded.request_deadline,
+                        active=excluded.active, response_policy=excluded.response_policy""",
+                        (
+                            demand["id"], profile["id"], demand["item_name"],
+                            demand["requested_quantity"], demand.get("remaining_quantity", demand["requested_quantity"]),
+                            demand["unit"], demand.get("minimum_quantity", demand["requested_quantity"]),
+                            demand.get("priority", 0), demand.get("request_deadline"),
+                            int(demand.get("active", True)), demand.get("response_policy", "accept_if_eligible"),
+                        ),
+                    )
         return len(profiles)
 
     def list_ngos(self) -> list[dict[str, Any]]:
@@ -413,10 +577,76 @@ class Database:
                 item["accepted_categories"] = json.loads(item.pop("accepted_categories_json"))
                 item["available"] = bool(item["available"])
                 item["synthetic"] = bool(item["synthetic"])
+                item["demands"] = [
+                    dict(demand)
+                    for demand in connection.execute(
+                        "SELECT id, item_name, requested_quantity, remaining_quantity, unit, minimum_quantity, "
+                        "priority, request_deadline, active, response_policy, synthetic "
+                        "FROM ngo_demands WHERE ngo_id = ? ORDER BY priority DESC, item_name",
+                        (item["id"],),
+                    ).fetchall()
+                ]
+                for demand in item["demands"]:
+                    demand["active"] = bool(demand["active"])
+                    demand["synthetic"] = bool(demand["synthetic"])
                 result.append(item)
             return result
 
-    def metrics(self) -> dict[str, int]:
+    def reserve_ngo_demand(self, ngo_id: str, offer_items: list[dict[str, Any]], donation_id: str) -> dict[str, Any]:
+        with self.transaction() as connection:
+            profile = connection.execute(
+                "SELECT available, available_capacity FROM ngo_profiles WHERE id = ?", (ngo_id,)
+            ).fetchone()
+            if profile is None:
+                raise ValueError(f"Unknown synthetic receiver: {ngo_id}")
+            if not profile["available"]:
+                raise ValueError("Selected receiver is unavailable")
+            total = sum(float(item["quantity"]) for item in offer_items)
+            if profile["available_capacity"] < total:
+                raise ValueError("Selected receiver no longer has sufficient capacity")
+            demands = connection.execute(
+                "SELECT * FROM ngo_demands WHERE ngo_id = ? AND active = 1 ORDER BY priority DESC",
+                (ngo_id,),
+            ).fetchall()
+            matched: list[sqlite3.Row] = []
+            for item in offer_items:
+                name = str(item["name"]).strip().lower()
+                unit = str(item["unit"]).strip().lower()
+                match = next(
+                    (
+                        demand for demand in demands
+                        if demand["remaining_quantity"] >= item["quantity"]
+                        and demand["minimum_quantity"] <= item["quantity"]
+                        and demand["unit"].lower() == unit
+                        and (
+                            demand["item_name"].lower() == name
+                            or (demand["item_name"].lower() == "vegetarian food" and item.get("category") == "vegetarian")
+                        )
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise ValueError(f"Receiver demand no longer matches item '{name}' in {unit}")
+                matched.append(match)
+            for demand, item in zip(matched, offer_items):
+                remaining = demand["remaining_quantity"] - float(item["quantity"])
+                connection.execute(
+                    "UPDATE ngo_demands SET remaining_quantity = ?, active = ? WHERE id = ?",
+                    (remaining, int(remaining > 0), demand["id"]),
+                )
+            connection.execute(
+                "UPDATE ngo_profiles SET available_capacity = available_capacity - ? WHERE id = ?",
+                (total, ngo_id),
+            )
+            return {
+                "ngo_id": ngo_id,
+                "donation_id": donation_id,
+                "reserved_quantity": total,
+                "demands": [{"id": demand["id"], "remaining_quantity": demand["remaining_quantity"] - float(item["quantity"])}
+                            for demand, item in zip(matched, offer_items)],
+            }
+
+    def metrics(self) -> dict[str, Any]:
         with self.connection() as connection:
             rows = connection.execute("SELECT status, COUNT(*) AS count FROM donations GROUP BY status").fetchall()
             by_status = {row["status"]: row["count"] for row in rows}
@@ -428,6 +658,19 @@ class Database:
             by_status["ACCEPTED_AWAITING_DELIVERY"] = by_status.get("ACCEPTED", 0)
             by_status["COMPLETED_DEMO_DELIVERIES"] = by_status.get("COMPLETED", 0)
             by_status["ESCALATED_CASES"] = by_status.get("ESCALATED", 0)
+            usage = connection.execute(
+                """SELECT COUNT(*) AS requests,                 SUM(CASE WHEN outcome = 'retrying' THEN 1 ELSE 0 END) AS retries,
+                SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN error_category = 'rate_limit' THEN 1 ELSE 0 END) AS rate_limits,
+                SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens
+                FROM llm_usage"""
+            ).fetchone()
+            by_status["GEMINI_REQUESTS"] = usage["requests"] or 0
+            by_status["GEMINI_RETRIES"] = usage["retries"] or 0
+            by_status["GEMINI_FAILED_REQUESTS"] = usage["failed"] or 0
+            by_status["GEMINI_RATE_LIMIT_ERRORS"] = usage["rate_limits"] or 0
+            by_status["GEMINI_INPUT_TOKENS"] = usage["input_tokens"]
+            by_status["GEMINI_OUTPUT_TOKENS"] = usage["output_tokens"]
             return by_status
 
     def _decode_donation(self, row: sqlite3.Row, connection: sqlite3.Connection, include_details: bool = True) -> dict[str, Any]:
@@ -454,8 +697,8 @@ class Database:
                 events.append(event)
             result["audit_events"] = events
             result["agent_executions"] = self.list_agent_executions(result["id"])
+            result["llm_usage"] = self.llm_usage(result["id"], self.config.llm_budget_per_donation)
         return result
 
 
 database = Database()
-

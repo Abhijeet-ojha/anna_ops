@@ -9,6 +9,7 @@ from annaops.agents.intake import IntakeAgent
 from annaops.agents.matching import FICTIONAL_NGOS, MatchRouteAgent
 from annaops.agents.safety import SafetyAgent
 from annaops.config import Settings
+from annaops.db import Database
 from annaops.schemas import ExtractedOffer, SafetyVerdict
 from tests.conftest import complete_message
 
@@ -73,6 +74,45 @@ def test_matching_excludes_capacity_and_food_incompatibility(test_settings: Sett
     assert any("capacity" in reason for reason in result.exclusions["ngo-05"])
     assert result.candidates[0].route.method == "straight_line_fallback"
     assert result.candidates[0].route.duration_minutes is None
+
+
+def test_synthetic_demand_is_persisted_idempotently(test_settings: Settings):
+    database = Database(test_settings)
+    database.initialize()
+    first = database.seed_ngos(FICTIONAL_NGOS)
+    second = database.seed_ngos(FICTIONAL_NGOS)
+    profiles = database.list_ngos()
+    assert first == second == 12
+    pasta = next(profile for profile in profiles if profile["id"] == "ngo-07")
+    assert pasta["demands"][0]["item_name"] == "pasta"
+    with database.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM ngo_demands").fetchone()[0] == 15
+
+
+def test_demand_and_capacity_reservation_survive_reseeding(test_settings: Settings):
+    database = Database(test_settings)
+    database.initialize()
+    database.seed_ngos(FICTIONAL_NGOS)
+    before = next(profile for profile in database.list_ngos() if profile["id"] == "ngo-07")
+    database.reserve_ngo_demand(
+        "ngo-07", [{"name": "pasta", "quantity": 30, "unit": "kg", "category": "unknown"}], "donation-1"
+    )
+    database.seed_ngos(FICTIONAL_NGOS)
+    after = next(profile for profile in database.list_ngos() if profile["id"] == "ngo-07")
+    assert after["available_capacity"] == before["available_capacity"] - 30
+    assert after["demands"][0]["remaining_quantity"] == 10
+
+
+def test_matching_requires_exact_demand_item_and_unit(test_settings: Settings):
+    now = datetime.now(test_settings.timezone)
+    offer = ExtractedOffer(
+        food_type="sushi", food_category="non_vegetarian", quantity=20, unit="portions",
+        prepared_at=now - timedelta(minutes=10), pickup_deadline=now + timedelta(hours=2),
+        storage_conditions="kept hot", donor_location="Demo", missing_fields=[],
+    )
+    result = MatchRouteAgent(test_settings).match(offer, FICTIONAL_NGOS, now=now)
+    assert not result.candidates
+    assert any("No active demand accepts" in reason for reason in result.exclusions["ngo-07"])
 
 
 def test_missing_coordinates_do_not_fabricate_route(test_settings: Settings):
@@ -140,16 +180,23 @@ def test_informal_clarification_times_use_configured_local_submission_date(test_
             "prepared_at": "6 pm",
             "pickup_deadline": "8 pm",
             "donor_location": "bengaluru",
-            "storage_conditions": "cold",
+            "storage_conditions": "refrigerated",
         },
         reference_at=reference,
     )
     assert merged.prepared_at.isoformat() == "2026-10-23T18:00:00+05:30"
     assert merged.pickup_deadline.isoformat() == "2026-10-23T20:00:00+05:30"
     assert merged.donor_location == "bengaluru"
-    assert merged.storage_conditions == "cold"
+    assert merged.storage_conditions == "refrigerated"
     assert "prepared_at.date_from_submission" in merged.inferred_fields
     assert merged.food_items == current.food_items
+
+
+def test_unsupported_storage_clarification_is_rejected(test_settings: Settings):
+    agent = IntakeAgent(test_settings)
+    current = agent.extract("20 portions vegetarian rice")
+    with pytest.raises(ValueError, match="Unsupported storage condition 'normal'"):
+        agent.merge_clarification(current, {"storage_conditions": "normal"})
 
 
 @pytest.mark.parametrize("answer", ["6", "evening", "25 pm"])
@@ -162,4 +209,3 @@ def test_ambiguous_or_invalid_clarification_time_is_rejected(test_settings: Sett
             {"prepared_at": answer},
             reference_at=datetime(2026, 10, 23, 12, 0, tzinfo=UTC),
         )
-

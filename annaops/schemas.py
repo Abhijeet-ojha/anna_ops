@@ -96,6 +96,7 @@ class MatchCandidate(BaseModel):
     available_capacity: float
     reasons: list[str]
     route: RouteEstimate
+    matched_demands: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class MatchResult(BaseModel):
@@ -134,6 +135,13 @@ class ClarificationRequest(BaseModel):
         return value
 
 
+class SafetyReviewRequest(BaseModel):
+    decision: Literal["approve", "request_clarification", "reject"]
+    actor: str = Field(min_length=2, max_length=100)
+    reason: str = Field(min_length=3, max_length=1000)
+    idempotency_key: str | None = Field(default=None, max_length=100)
+
+
 class ActionRequest(BaseModel):
     actor: str = Field(default="demo_donor", min_length=2, max_length=100)
     reason: str | None = Field(default=None, max_length=1000)
@@ -167,4 +175,3 @@ class AgentDecision(BaseModel):
     expected_outcome: str = Field(min_length=1, max_length=1000)
     human_input_required: bool = False
     task_complete: bool = False
-

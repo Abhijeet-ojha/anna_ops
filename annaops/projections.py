@@ -10,7 +10,7 @@ def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
     parsed = donation.get("parsed") or {}
     safety = donation.get("safety") or {}
     match = donation.get("match") or {}
-    approvals = donation.get("approvals") or []
+    approvals = donation.get("approval_decisions") or []
     attempts = donation.get("dispatch_attempts") or []
 
     def latest(*types: str) -> dict[str, Any] | None:
@@ -51,7 +51,7 @@ def project_workflow(donation: dict[str, Any]) -> dict[str, Any]:
 
     intake_event = latest("INTAKE_PARSED", "INTAKE_CLARIFICATION_REQUIRED", "INTAKE_FAILED")
     intake_status = "completed" if parsed else ("failed" if current_status == "ERROR" else "pending")
-    source_name = "Gemini 3.6 Flash" if parsed.get("extraction_source") == "configured_llm" else parsed.get("extraction_source", "unknown")
+    source_name = "Configured LLM" if parsed.get("extraction_source") == "configured_llm" else parsed.get("extraction_source", "unknown")
     intake_explanation = (
         f"Extracted {len(parsed.get('food_items') or []) or 1} structured food line(s) using {source_name}."
         if parsed else ("Extraction failed; preserved safely for retry." if current_status == "ERROR" else "Waiting for structured extraction.")

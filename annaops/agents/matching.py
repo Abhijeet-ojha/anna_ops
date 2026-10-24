@@ -18,13 +18,40 @@ FICTIONAL_NGOS: list[dict[str, Any]] = [
     {"id": "ngo-04", "name": "Harvest Halo Trust", "service_area": "Jaipur South (synthetic)", "latitude": 26.8500, "longitude": 75.7900, "accepted_categories": ["vegetarian", "mixed"], "max_capacity": 300, "available_capacity": 240, "opens_at": "06:00", "closes_at": "20:00", "available": True, "minimum_quantity": 20},
     {"id": "ngo-05", "name": "Lantern Lunch Mission", "service_area": "Jaipur East (synthetic)", "latitude": 26.9100, "longitude": 75.8500, "accepted_categories": ["vegetarian", "non_vegetarian", "mixed"], "max_capacity": 80, "available_capacity": 55, "opens_at": "10:00", "closes_at": "22:30", "available": True, "minimum_quantity": 5},
     {"id": "ngo-06", "name": "Mosaic Meals Alliance", "service_area": "Sanganer (synthetic)", "latitude": 26.8200, "longitude": 75.8000, "accepted_categories": ["vegetarian", "non_vegetarian", "mixed", "unknown"], "max_capacity": 180, "available_capacity": 120, "opens_at": "00:00", "closes_at": "23:59", "available": True, "minimum_quantity": 12},
-    {"id": "ngo-07", "name": "Open Palm Pantry", "service_area": "Amer (synthetic)", "latitude": 26.9850, "longitude": 75.8500, "accepted_categories": ["vegetarian"], "max_capacity": 90, "available_capacity": 60, "opens_at": "07:30", "closes_at": "20:30", "available": True, "minimum_quantity": 5},
+    {"id": "ngo-07", "name": "Open Palm Pantry", "service_area": "Amer (synthetic)", "latitude": 26.9850, "longitude": 75.8500, "accepted_categories": ["vegetarian", "unknown"], "max_capacity": 90, "available_capacity": 60, "opens_at": "07:30", "closes_at": "20:30", "available": True, "minimum_quantity": 5},
     {"id": "ngo-08", "name": "Silver Grain Society", "service_area": "Jagatpura (synthetic)", "latitude": 26.8350, "longitude": 75.8650, "accepted_categories": ["vegetarian", "non_vegetarian", "mixed"], "max_capacity": 200, "available_capacity": 0, "opens_at": "08:00", "closes_at": "22:00", "available": False, "minimum_quantity": 15},
     {"id": "ngo-09", "name": "Sunrise Serving Circle", "service_area": "Vidhyadhar Nagar (synthetic)", "latitude": 26.9650, "longitude": 75.7800, "accepted_categories": ["vegetarian", "mixed"], "max_capacity": 140, "available_capacity": 110, "opens_at": "05:30", "closes_at": "19:00", "available": True, "minimum_quantity": 10},
     {"id": "ngo-10", "name": "Together Table Guild", "service_area": "Mansarovar (synthetic)", "latitude": 26.8550, "longitude": 75.7650, "accepted_categories": ["vegetarian", "non_vegetarian", "mixed", "unknown"], "max_capacity": 260, "available_capacity": 200, "opens_at": "00:00", "closes_at": "23:59", "available": True, "minimum_quantity": 20},
     {"id": "ngo-11", "name": "Willow Basket Initiative", "service_area": "Civil Lines (synthetic)", "latitude": 26.9050, "longitude": 75.7750, "accepted_categories": ["vegetarian"], "max_capacity": 65, "available_capacity": 35, "opens_at": "08:00", "closes_at": "21:00", "available": True, "minimum_quantity": 5},
     {"id": "ngo-12", "name": "Yellow Apron Community", "service_area": "Malviya Nagar (synthetic)", "latitude": 26.8600, "longitude": 75.8150, "accepted_categories": ["vegetarian", "non_vegetarian", "mixed"], "max_capacity": 175, "available_capacity": 130, "opens_at": "07:00", "closes_at": "22:00", "available": True, "minimum_quantity": 10},
 ]
+
+SYNTHETIC_DEMANDS: dict[str, list[dict[str, Any]]] = {
+    "ngo-01": [{"id": "demand-ngo-01-meals", "item_name": "vegetarian food", "requested_quantity": 100, "unit": "portions", "minimum_quantity": 10, "priority": 70}],
+    "ngo-02": [
+        {"id": "demand-ngo-02-rajma", "item_name": "rajma chawal", "requested_quantity": 50, "unit": "kg", "minimum_quantity": 20, "priority": 90},
+        {"id": "demand-ngo-02-chicken-rice", "item_name": "chicken rice", "requested_quantity": 200, "unit": "portions", "minimum_quantity": 10, "priority": 10},
+    ],
+    "ngo-03": [{"id": "demand-ngo-03-nachos", "item_name": "nachos", "requested_quantity": 50, "unit": "kg", "minimum_quantity": 20, "priority": 60}],
+    "ngo-04": [
+        {"id": "demand-ngo-04-rice", "item_name": "cooked rice", "requested_quantity": 30, "unit": "kg", "minimum_quantity": 15, "priority": 80},
+        {"id": "demand-ngo-04-dal", "item_name": "dal", "requested_quantity": 20, "unit": "kg", "minimum_quantity": 10, "priority": 80},
+    ],
+    "ngo-05": [{"id": "demand-ngo-05-paneer", "item_name": "paneer curry", "requested_quantity": 25, "unit": "kg", "minimum_quantity": 10, "priority": 70}],
+    "ngo-06": [
+        {"id": "demand-ngo-06-meals", "item_name": "vegetarian food", "requested_quantity": 100, "unit": "portions", "minimum_quantity": 25, "priority": 100},
+        {"id": "demand-ngo-06-chicken-rice", "item_name": "chicken rice", "requested_quantity": 120, "unit": "portions", "minimum_quantity": 20, "priority": 10},
+    ],
+    "ngo-07": [{"id": "demand-ngo-07-pasta", "item_name": "pasta", "requested_quantity": 40, "unit": "kg", "minimum_quantity": 20, "priority": 60}],
+    "ngo-08": [{"id": "demand-ngo-08-rice", "item_name": "rice", "requested_quantity": 60, "unit": "kg", "minimum_quantity": 20, "priority": 50}],
+    "ngo-09": [{"id": "demand-ngo-09-pasta", "item_name": "pasta", "requested_quantity": 50, "unit": "kg", "minimum_quantity": 25, "priority": 50}],
+    "ngo-10": [{"id": "demand-ngo-10-rajma", "item_name": "rajma chawal", "requested_quantity": 50, "unit": "kg", "minimum_quantity": 20, "priority": 80}],
+    "ngo-11": [{"id": "demand-ngo-11-rice", "item_name": "cooked rice", "requested_quantity": 20, "unit": "kg", "minimum_quantity": 10, "priority": 50}],
+    "ngo-12": [{"id": "demand-ngo-12-dal", "item_name": "dal", "requested_quantity": 30, "unit": "kg", "minimum_quantity": 15, "priority": 50}],
+}
+
+for _profile in FICTIONAL_NGOS:
+    _profile["demands"] = SYNTHETIC_DEMANDS.get(_profile["id"], [])
 
 
 class MatchRouteAgent:
@@ -43,6 +70,7 @@ class MatchRouteAgent:
 
         for ngo in ngos:
             reasons: list[str] = []
+            matched_demands: list[dict[str, Any]] = []
             if ngo["id"] in excluded_ids:
                 reasons.append("Already attempted for this donation.")
             if not ngo["available"]:
@@ -53,6 +81,46 @@ class MatchRouteAgent:
                 reasons.append(f"Quantity is below the receiver minimum of {ngo['minimum_quantity']:g}.")
             if offer.food_category not in ngo["accepted_categories"]:
                 reasons.append(f"Food category '{offer.food_category}' is not accepted.")
+            demands = [demand for demand in ngo.get("demands", []) if demand.get("active", True)]
+            active_demands = []
+            for demand in demands:
+                deadline = demand.get("request_deadline")
+                if deadline and datetime.fromisoformat(deadline.replace("Z", "+00:00")) <= now:
+                    continue
+                active_demands.append(demand)
+            demands = active_demands
+            for item in offer.food_items or [{
+                "name": offer.food_type or "",
+                "quantity": quantity,
+                "unit": offer.unit or "",
+                "category": offer.food_category,
+            }]:
+                item_name = item.name if hasattr(item, "name") else item["name"]
+                item_quantity = item.quantity if hasattr(item, "quantity") else item["quantity"]
+                item_unit = item.unit if hasattr(item, "unit") else item["unit"]
+                item_category = item.category if hasattr(item, "category") else item["category"]
+                demand = next(
+                    (
+                        candidate for candidate in demands
+                        if candidate.get("remaining_quantity", candidate["requested_quantity"]) >= item_quantity
+                        and candidate["minimum_quantity"] <= item_quantity
+                        and candidate["unit"].lower() == item_unit.lower()
+                        and (
+                            candidate["item_name"].lower() == item_name.lower()
+                            or (candidate["item_name"].lower() == "vegetarian food" and item_category == "vegetarian")
+                        )
+                    ),
+                    None,
+                )
+                if demand is None:
+                    reasons.append(f"No active demand accepts {item_quantity:g} {item_unit} of '{item_name}'.")
+                else:
+                    matched_demands.append({
+                        "id": demand["id"], "item_name": demand["item_name"],
+                        "requested_quantity": demand["requested_quantity"],
+                        "remaining_quantity": demand.get("remaining_quantity", demand["requested_quantity"]),
+                        "unit": demand["unit"], "minimum_quantity": demand["minimum_quantity"],
+                    })
             if offer.pickup_deadline:
                 local_deadline = offer.pickup_deadline.astimezone(self.config.timezone)
                 deadline_minutes = local_deadline.hour * 60 + local_deadline.minute
@@ -83,6 +151,7 @@ class MatchRouteAgent:
             candidates.append(MatchCandidate(
                 ngo_id=ngo["id"], ngo_name=ngo["name"], score=round(score, 2),
                 available_capacity=ngo["available_capacity"], reasons=score_reasons, route=route,
+                matched_demands=matched_demands,
             ))
 
         candidates.sort(key=lambda item: (-item.score, item.ngo_id))
@@ -134,4 +203,3 @@ class MatchRouteAgent:
         delta_p, delta_l = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
         value = math.sin(delta_p / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(delta_l / 2) ** 2
         return 2 * radius * math.atan2(math.sqrt(value), math.sqrt(1 - value))
-

@@ -96,3 +96,13 @@ textarea { resize: vertical; line-height: 1.55; } textarea:focus, input:focus, s
 .execution-error-box { margin-top: 14px; padding: 12px 14px; border-radius: 8px; background: #fff5f5; border: 1px solid #ffd4d4; }
 .retry-guidance { margin-top: 8px !important; color: #1e633a !important; font-size: 11px !important; font-weight: 600; }
 .input-summary-box { max-height: 180px; overflow: auto; background: #f4f5f1; padding: 10px 12px; border-radius: 6px; font-size: 11px; white-space: pre-wrap; }
+
+.tool-input-heading { margin-top: 12px; display: flex !important; justify-content: space-between; align-items: center; gap: 12px; }
+.tool-input-heading span { color: var(--ink); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.tool-input-heading small { padding: 4px 7px; border-radius: 999px; background: #e8f2ec; color: var(--green); font-size: 9px; font-weight: 750; }
+.tool-arguments { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 8px 0 12px; }
+.tool-arguments > div { min-width: 0; padding: 9px 10px; border: 1px solid #e2e5dc; border-radius: 7px; background: #f8f8f4; }
+.tool-arguments dt { margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.tool-arguments dd { margin: 0; color: var(--ink); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.tool-empty-arguments { margin: 8px 0 !important; padding: 8px 10px; border-radius: 6px; background: #f6f6f1; font-size: 11px !important; }
+@media (max-width: 600px) { .tool-arguments { grid-template-columns: 1fr; } .tool-input-heading { align-items: flex-start; flex-direction: column; } }

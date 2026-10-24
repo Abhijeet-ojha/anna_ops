@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
@@ -30,6 +31,15 @@ class ToolSpec:
     description: str
     handler: Callable[[BaseModel], Any]
     arguments_model: type[BaseModel] = NoArguments
+    bound_arguments: dict[str, Any] | Callable[[], dict[str, Any]] | None = None
+
+    def observable_arguments(self, validated_arguments: BaseModel) -> tuple[dict[str, Any], str]:
+        """Return safe inputs for the audit trail without widening the LLM tool schema."""
+        caller_arguments = validated_arguments.model_dump(mode="json")
+        if self.bound_arguments is None:
+            return caller_arguments, "llm_supplied"
+        backend_arguments = self.bound_arguments() if callable(self.bound_arguments) else self.bound_arguments
+        return backend_arguments, "backend_bound"
 
 
 @dataclass(frozen=True)
@@ -42,12 +52,13 @@ class RuntimeOutcome:
 class BoundedToolRuntime:
     """Runs a model/tool loop with a hard iteration cap and backend-owned tools."""
 
-    def __init__(self, config: Settings = settings, client: StructuredLLMClient | None = None):
+    def __init__(self, config: Settings = settings, client: StructuredLLMClient | None = None, database: Any | None = None):
         self.config = config
+        self.database = database
         if client is None and getattr(config, "testing_mode", False):
             self.client = TestMockClient(config)
         else:
-            self.client = client or StructuredLLMClient(config)
+            self.client = client or StructuredLLMClient(config, database=database)
 
     def run(
         self,
@@ -58,6 +69,7 @@ class BoundedToolRuntime:
         tools: list[ToolSpec],
         allowed_actions: set[str],
         required_tools: set[str] | None = None,
+        donation_id: str | None = None,
     ) -> RuntimeOutcome:
         registry = {tool.name: tool for tool in tools}
         required_tools = required_tools or set()
@@ -73,8 +85,7 @@ class BoundedToolRuntime:
             for tool in tools
         ]
         for iteration in range(1, self.config.agent_max_iterations + 1):
-            invocation = self.client.complete_structured(
-                AgentDecision,
+            kwargs = dict(
                 system_prompt=(
                     f"You are the {agent_name}. Select only registered tools and allowed final actions. "
                     "When calling tools, set proposed_action='use_tools' and populate tool_calls. "
@@ -93,6 +104,24 @@ class BoundedToolRuntime:
                     "iterations_remaining": self.config.agent_max_iterations - iteration,
                 },
             )
+            if donation_id and "donation_id" in inspect.signature(self.client.complete_structured).parameters:
+                kwargs.update(donation_id=donation_id, agent_type=agent_name, workflow_stage=agent_name)
+            client_parameters = inspect.signature(self.client.complete_structured).parameters
+            active_tools = tools if not tool_events else []
+            if "tools" in client_parameters:
+                kwargs["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.arguments_model.model_json_schema(),
+                        },
+                    }
+                    for tool in active_tools
+                ]
+                kwargs["tool_choice"] = "auto" if active_tools else "none"
+            invocation = self.client.complete_structured(AgentDecision, **kwargs)
             decision = AgentDecision.model_validate(invocation.output)
             invocations.append(invocation)
             if decision.tool_calls:
@@ -107,10 +136,12 @@ class BoundedToolRuntime:
                     except ValidationError as exc:
                         raise AgentProtocolError(f"Invalid arguments for tool '{requested.name}'") from exc
                     result = spec.handler(arguments)
+                    observable_arguments, argument_source = spec.observable_arguments(arguments)
                     tool_events.append({
                         "sequence": len(tool_events) + 1,
                         "name": spec.name,
-                        "arguments": arguments.model_dump(mode="json"),
+                        "arguments": observable_arguments,
+                        "argument_source": argument_source,
                         "purpose": requested.purpose,
                         "result": result,
                     })
