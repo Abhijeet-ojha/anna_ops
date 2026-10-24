@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -77,6 +77,8 @@ class BoundedToolRuntime:
                 AgentDecision,
                 system_prompt=(
                     f"You are the {agent_name}. Select only registered tools and allowed final actions. "
+                    "When calling tools, set proposed_action='use_tools' and populate tool_calls. "
+                    "Only choose from allowed_final_actions when concluding your final decision. "
                     "Use tools before deciding when current evidence is insufficient. Never claim a tool result "
                     "you have not received. Keep evidence concise and do not reveal chain-of-thought."
                 ),
@@ -95,7 +97,7 @@ class BoundedToolRuntime:
             invocations.append(invocation)
             if decision.tool_calls:
                 if decision.proposed_action != "use_tools":
-                    raise AgentProtocolError("A decision with tool calls must use the 'use_tools' action")
+                    decision.proposed_action = "use_tools"
                 for requested in decision.tool_calls:
                     spec = registry.get(requested.name)
                     if spec is None:
